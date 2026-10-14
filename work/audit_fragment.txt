@@ -1,0 +1,199 @@
+
+def _normalize_column_name(name: object) -> str:
+    """Ignore case, whitespace, punctuation and underscores in field names."""
+    return ''.join(ch.lower() for ch in str(name) if ch.isalnum())
+
+
+def _find_column(df: pd.DataFrame, candidates: List[str]) -> str | None:
+    for candidate in candidates:
+        hits = [c for c in df.columns if _normalize_column_name(c) == _normalize_column_name(candidate)]
+        if len(hits) > 1:
+            raise RuntimeError(f'Ambiguous CFTC field: {candidate}')
+        if hits:
+            return hits[0]
+    return None
+
+
+def _audit_columns(df: pd.DataFrame):
+    """Identify fields conservatively; ambiguous/unknown schemas fail clearly."""
+    asset = _find_column(df, ['Market_and_Exchange_Names', 'Market_and_Exchange_Name', 'Market_Name'])
+    code = _find_column(df, ['CFTC_Contract_Market_Code', 'Contract_Market_Code'])
+    date_cols = []
+    for c in df.columns:
+        name = _normalize_column_name(c)
+        if name.startswith(('reportdate', 'asofdate')):
+            date_cols.append(c)
+    # Prefer full dates, using compact dates to recover blank/unparseable cells.
+    date_cols.sort(key=lambda c: ('yymmdd' in _normalize_column_name(c), str(c)))
+    if asset is None or not date_cols:
+        raise RuntimeError(f'Cannot identify market/report-date fields. Columns: {list(df.columns)}')
+    return asset, code, date_cols
+
+
+def _parse_cot_dates(series: pd.Series) -> pd.Series:
+    """Parse mixed CFTC dates explicitly, avoiding integer-as-nanosecond errors.
+
+    Six-digit YYMMDD is interpreted as 20YYMMDD for these post-2006 datasets,
+    avoiding Python's 1969 pivot. Full four-digit-year fields are preferred.
+    """
+    raw = series.fillna('').astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+    result = pd.Series(pd.NaT, index=series.index, dtype='datetime64[ns]')
+    compact = raw.str.fullmatch(r'\d{6}')
+    result.loc[compact] = pd.to_datetime('20' + raw.loc[compact], format='%Y%m%d', errors='coerce')
+    for fmt in ('%Y%m%d', '%Y-%m-%d', '%m/%d/%Y', '%Y/%m/%d', '%m-%d-%Y', '%Y-%m-%d %H:%M:%S'):
+        mask = result.isna()
+        result.loc[mask] = pd.to_datetime(raw.loc[mask], format=fmt, errors='coerce')
+    # Excel serial dates only within a plausible range for COT's modern era.
+    serial = result.isna() & raw.str.fullmatch(r'\d{5}')
+    if serial.any():
+        numbers = pd.to_numeric(raw.loc[serial], errors='coerce')
+        numbers = numbers.where(numbers.between(38718, 100000))
+        result.loc[serial] = pd.to_datetime(numbers, unit='D', origin='1899-12-30', errors='coerce')
+    return result.dt.normalize()
+
+
+def _report_dates(df: pd.DataFrame) -> pd.Series:
+    _, _, columns = _audit_columns(df)
+    result = pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns]')
+    for col in columns:
+        result = result.fillna(_parse_cot_dates(df[col]))
+    return result
+
+
+def _find_long_gaps(dates, threshold_days: int = 10) -> List[str]:
+    """Report observed intervals strictly greater than the threshold, not guessed dates."""
+    ordered = sorted(set(dates))
+    return [f'{a.date()} -> {b.date()} ({(b-a).days} days)'
+            for a, b in zip(ordered, ordered[1:]) if (b-a).days > threshold_days]
+
+
+def build_data_quality_audit(df: pd.DataFrame, stale_after_days: int = 10,
+                             today=None) -> tuple[pd.DataFrame, dict]:
+    """Audit without modifying raw rows; retain invalid rows in counts and flags.
+
+    Stable contract codes group renamed markets together; missing codes fall back
+    to market names. Duplicate_Date_Rows counts excess valid rows per date (N-1).
+    Coverage uses unique valid dates / source dates since first observation.
+    Lagging takes freshness precedence over delayed; Source_Status independently
+    exposes stale source data even when a contract also lags. Negative ages are
+    avoided by excluding and flagging future observations. A contract with no valid
+    dates remains visible as NO_VALID_DATES with unknown coverage/lag.
+    """
+    if df.empty:
+        raise RuntimeError('Cannot audit an empty dataset.')
+    if stale_after_days < 0:
+        raise ValueError('stale_after_days must be nonnegative')
+    now = pd.Timestamp.now(tz='UTC') if today is None else pd.Timestamp(today)
+    if now.tzinfo is not None:
+        now = now.tz_convert('UTC').tz_localize(None)
+    now = now.normalize()
+    asset_col, code_col, _ = _audit_columns(df)
+    work = pd.DataFrame(index=range(len(df)))
+    work['asset'] = df[asset_col].fillna('').astype(str).str.strip().to_numpy()
+    work['code'] = (df[code_col].fillna('').astype(str).str.strip().str.strip('"').str.replace(r'\.0$', '', regex=True).to_numpy()
+                    if code_col is not None else '')
+    work['date'] = _report_dates(df).to_numpy()
+    work['future'] = work['date'] > now
+    work['invalid'] = work['date'].isna()
+    work.loc[work['future'], 'date'] = pd.NaT
+    work['key'] = ['code:' + c if c else 'name:' + a for c, a in zip(work['code'], work['asset'])]
+    source_dates = sorted(work['date'].dropna().unique())
+    source_dates = [pd.Timestamp(d) for d in source_dates]
+    if not source_dates:
+        raise RuntimeError('No valid non-future report dates in source; refusing upload.')
+    source_latest = source_dates[-1]
+    source_age = (now - source_latest).days
+    source_status = 'SOURCE_DELAYED' if source_age > stale_after_days else 'CURRENT'
+    source_gaps = _find_long_gaps(source_dates)
+    rows = []
+    iso = lambda d: pd.Timestamp(d).date().isoformat() if pd.notna(d) else ''
+    for _, group in work.groupby('key', sort=True, dropna=False):
+        ordered = group.sort_values('date', na_position='first')
+        names = ordered.loc[ordered['asset'].ne(''), 'asset']
+        asset = names.iloc[-1] if len(names) else '(missing market name)'
+        code = group['code'].iloc[0]
+        dates = sorted(pd.Timestamp(d) for d in group['date'].dropna().unique())
+        earliest = dates[0] if dates else pd.NaT
+        latest = dates[-1] if dates else pd.NaT
+        expected = [d for d in source_dates if d >= earliest] if dates else []
+        missing = sorted(set(expected) - set(dates))
+        lag = (source_latest - latest).days if dates else ''
+        behind = sum(d > latest for d in source_dates) if dates else ''
+        gaps = _find_long_gaps(dates)
+        duplicate_dates = group['date'].dropna().value_counts()
+        duplicate_dates = duplicate_dates[duplicate_dates > 1].sort_index()
+        duplicates = int((duplicate_dates - 1).sum())
+        invalid = int(group['invalid'].sum())
+        future = int(group['future'].sum())
+        freshness = ('ASSET_LAGGING' if lag > 0 else source_status) if dates else 'NO_VALID_DATES'
+        flags = []
+        for condition, flag in [(bool(missing), 'MISSING_SOURCE_DATES'), (bool(gaps), 'LONG_CALENDAR_GAPS'),
+                                (duplicates > 0, 'DUPLICATE_DATES'), (invalid > 0, 'INVALID_DATES'),
+                                (future > 0, 'FUTURE_DATES'), (bool(source_gaps), 'SOURCE_CALENDAR_GAPS'),
+                                (group['asset'].eq('').any(), 'MISSING_ASSET_NAME'),
+                                (group['code'].eq('').any(), 'MISSING_CONTRACT_CODE')]:
+            if condition:
+                flags.append(flag)
+        rows.append({
+            'Asset': asset, 'CFTC_Contract_Market_Code': code,
+            'Status': ' | '.join([freshness] + flags), 'Freshness': freshness,
+            'Flags': ' | '.join(flags), 'Source_Status': source_status,
+            'Audit_Date_UTC': iso(now), 'Stale_After_Days': stale_after_days,
+            'Earliest_Report_Date': iso(earliest), 'Latest_Report_Date': iso(latest),
+            'Source_Earliest_Report_Date': iso(source_dates[0]), 'Source_Latest_Report_Date': iso(source_latest),
+            'Age_Days_vs_Today': (now-latest).days if dates else '',
+            'Source_Age_Days': source_age, 'Lag_Days_vs_Source': lag, 'Reports_Behind_Source': behind,
+            'Rows': len(group), 'Valid_Date_Rows': int(group['date'].notna().sum()),
+            'Invalid_Date_Rows': invalid, 'Future_Date_Rows': future,
+            'Unique_Report_Dates': len(dates), 'Expected_Source_Dates': len(expected) if dates else '',
+            'Coverage_Pct': round(100 * len(dates) / len(expected), 2) if expected else '',
+            'Missing_Source_Date_Count': len(missing) if dates else '',
+            'Missing_Source_Dates': ', '.join(iso(d) for d in missing),
+            'Long_Calendar_Gap_Count': len(gaps), 'Long_Calendar_Gaps': ' | '.join(gaps),
+            'Duplicate_Date_Rows': duplicates,
+            'Duplicate_Dates': ' | '.join(f'{iso(d)} ({count} rows)' for d, count in duplicate_dates.items()),
+            'Source_Report_Date_Count': len(source_dates),
+            'Source_Long_Calendar_Gap_Count': len(source_gaps), 'Source_Long_Calendar_Gaps': ' | '.join(source_gaps),
+            'Observed_Market_Names': ' | '.join(sorted(set(group['asset']) - {''})),
+            'Coverage_Basis': 'Observed source dates from first contract observation; selected annual file only',
+        })
+    audit = pd.DataFrame(rows)
+    audit['_lag_sort'] = pd.to_numeric(audit['Lag_Days_vs_Source'], errors='coerce').fillna(-1)
+    audit = audit.sort_values(['_lag_sort', 'Asset'], ascending=[False, True], kind='stable').drop(columns='_lag_sort').reset_index(drop=True)
+    summary = {
+        'source_earliest': iso(source_dates[0]), 'source_latest': iso(source_latest),
+        'source_age_days': source_age, 'source_status': source_status,
+        'source_report_dates': len(source_dates), 'source_calendar_gaps': source_gaps,
+        'asset_count': len(audit), 'row_count': len(df),
+        'current_count': int(audit['Freshness'].eq('CURRENT').sum()),
+        'source_delayed_count': int(audit['Freshness'].eq('SOURCE_DELAYED').sum()),
+        'lagging_count': int(audit['Freshness'].eq('ASSET_LAGGING').sum()),
+        'no_valid_dates_count': int(audit['Freshness'].eq('NO_VALID_DATES').sum()),
+        'assets_with_missing_dates': int(audit['Flags'].str.contains('MISSING_SOURCE_DATES').sum()),
+        'assets_with_long_gaps': int(audit['Long_Calendar_Gap_Count'].gt(0).sum()),
+        'assets_with_duplicates': int(audit['Duplicate_Date_Rows'].gt(0).sum()),
+        'invalid_date_rows': int(work['invalid'].sum()), 'future_date_rows': int(work['future'].sum()),
+    }
+    return audit, summary
+
+
+def print_audit_summary(sheet_name: str, audit_df: pd.DataFrame, summary: dict) -> None:
+    """Print compact totals and at most ten problem contracts; full detail is in the tab."""
+    print(f"\n{sheet_name} audit: {summary['asset_count']} contracts, {summary['row_count']} rows")
+    print(f"Source: {summary['source_earliest']} -> {summary['source_latest']}; "
+          f"{summary['source_report_dates']} dates; age {summary['source_age_days']} days; {summary['source_status']}")
+    print(f"Current {summary['current_count']} | Source delayed {summary['source_delayed_count']} | "
+          f"Lagging {summary['lagging_count']} | No valid dates {summary['no_valid_dates_count']}")
+    print(f"Contracts with missing dates {summary['assets_with_missing_dates']} | "
+          f"Long gaps {summary['assets_with_long_gaps']} | Duplicates {summary['assets_with_duplicates']} | "
+          f"Invalid/future rows {summary['invalid_date_rows']}/{summary['future_date_rows']}")
+    print(f"Source calendar gaps >10 days: {len(summary['source_calendar_gaps'])}")
+    for gap in summary['source_calendar_gaps'][:5]:
+        print('  ' + gap)
+    problems = audit_df.loc[audit_df['Status'].ne('CURRENT')]
+    if not problems.empty:
+        print(problems[['Asset', 'Status', 'Latest_Report_Date', 'Reports_Behind_Source']].head(10).to_string(index=False))
+        print(f"{len(problems)} contracts flagged; full details in {sheet_name}_Audit.")
+    print('Coverage: selected annual file, from each contract\'s first observation. Delay is age-based.')
+
+
