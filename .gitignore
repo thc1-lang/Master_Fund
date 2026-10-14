@@ -31,3 +31,10 @@ Thumbs.db
 cache/
 tmp/
 temp/
+
+# Codex temporary development files
+work/add_audit.py
+work/audit_fragment.txt
+work/inspect_workbook.py
+work/original.py
+work/revise.py
