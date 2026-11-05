@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 import tldextract
+from common.issuer_identity import normalize_cik
 
 from .extraction import extract_date, is_pdf, release_link
 from .ir_evidence import ownership
@@ -125,7 +126,9 @@ class OfficialSourceStrategy:
         self.fetcher = fetcher
         self.sec_fetcher = sec_fetcher
         self.cache_root = Path(cache_root or browser.config.download_root)
-        self.issuer_cik = str(issuer_cik or "").zfill(10) if issuer_cik else None
+        self.issuer_cik = normalize_cik(issuer_cik) if issuer_cik is not None else None
+        if issuer_cik is not None and not self.issuer_cik:
+            raise ValueError("CANONICAL_REGISTRANT_UNRESOLVED: invalid issuer CIK")
         self.observations: list[RouteObservation] = []
         self.documents: list[Document] = []
         self.statuses: dict[str, str] = {}
@@ -456,7 +459,10 @@ class OfficialSourceStrategy:
                 if not match:
                     self.statuses[SOURCE_SEC] = "UNUSABLE"
                     return
-                cik = str(match.get("cik_str") or match.get("cik")).zfill(10)
+                cik = normalize_cik(match.get("cik_str") or match.get("cik"))
+                if not cik:
+                    self.statuses[SOURCE_SEC] = "UNUSABLE"
+                    return
             submissions_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
             payload = await self._sec_json(submissions_url)
             recent = (payload.get("filings") or {}).get("recent") or {}

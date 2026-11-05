@@ -171,3 +171,45 @@ Director Qualifications and Nomination of Directors
     assert len(result.boards) == 2
     assert all(row.is_current and row.board_status == "CURRENT" for row in result.boards)
 
+
+def test_flattened_sec_position_and_executive_rosters_are_extracted():
+    text = """PROPOSAL NO. 1 ELECTION OF DIRECTORS
+Name Age(1) Position(s) Class Director Since
+Alice Example 55 Independent Director I 2020
+Bob Smith 58 President, Chief Executive Officer and Director II 2019
+Board Skills and Experience
+EXECUTIVE OFFICERS OF THE COMPANY
+The following table shows information about our executive officers as of the Record Date:
+Name Title
+Bob Smith President, Chief Executive Officer and Director
+Carol Jones Chief Financial Officer
+Biographical information for each of the above-named officers is set forth below.
+"""
+    result = parse_proxy_people(text, _filing(), "Test Co")
+    assert {person.full_name for person in result.people} >= {"Alice Example", "Bob Smith", "Carol Jones"}
+    assert len([row for row in result.boards if row.is_current]) >= 2
+    assert any("Chief Executive Officer" in role for person in result.people for role in person.current_roles)
+    assert result.diagnostics["SOURCE_ACCESSION"] == _filing().accession_number
+
+
+def test_flattened_committee_matrix_links_members_and_chairs():
+    text = """Committee membership as of the Record Date was as follows:
+Name Audit Compensation NCG
+Alice Example — Chair Member
+Bob Smith Chair Member —
+Carol Jones Member — Member
+Our Board has adopted written charters for each of these committees.
+"""
+    result = parse_proxy_people(
+        "Board of Directors\nAlice Example\nAlice Example is an independent director.\nBob Smith\nBob Smith is a director.\nCarol Jones\nCarol Jones is an independent director.",
+        _filing(), "Test Co",
+    )
+    proxy = CachedGovernanceSource("TST", _filing().accession_number, "DEF 14A", _filing().filing_date, None, _filing().source_url, "proxy.txt", text=text)
+    boards = build_board_memberships(_store_like(result.people, result.boards), "TST", as_of_date="2026-09-25")
+    committees = extract_committees("TST", proxy, result.people, boards)
+    by_type = {item.committee_type: item for item in committees}
+    assert len(by_type["audit"].members) == 2
+    assert len(by_type["compensation"].members) == 2
+    assert len(by_type["nominating_governance"].members) == 2
+    assert by_type["audit"].chair_person_id == next(person.person_id for person in result.people if person.full_name == "Bob Smith")
+

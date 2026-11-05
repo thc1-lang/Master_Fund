@@ -8,6 +8,7 @@ from typing import Any
 from .evidence_links import ArtifactReader, SourceCatalog, record_id
 from .models import CompanyResearchDossier, ReportFact
 from pipeline_runner.issuer_resolution import canonical_identity_hash
+from common.issuer_identity import normalize_cik
 
 REPORT_VERSION = "research-output-v1"
 
@@ -69,7 +70,7 @@ class Builder:
         self._doc_by_id={r.get("document_id"):r for r in self.documents}
         self.issuer_identity = self._load_issuer_identity()
         self.company_name=self.issuer_identity.get("legal_name") or self._infer_company_name()
-        self.issuer_cik = self.issuer_identity.get("issuer_cik") or self._infer_issuer_cik()
+        self.issuer_cik = normalize_cik(self.issuer_identity.get("issuer_cik") or self.issuer_identity.get("canonical_registrant_cik")) or self._infer_issuer_cik()
         self.issuer_identity.setdefault("requested_ticker", self.ticker)
         self.issuer_identity.setdefault("resolved_ticker", self.ticker)
         self.issuer_identity.setdefault("legal_name", self.company_name)
@@ -103,10 +104,14 @@ class Builder:
         for row in self.documents + self.claims:
             value = row.get("issuer_cik") or row.get("cik") or row.get("issuer_cik_number")
             if value:
-                return str(value).zfill(10)
+                cik = normalize_cik(value)
+                if cik:
+                    return cik
             match = re.search(r"/data/(\d{6,12})/", str(row.get("source_url") or ""))
             if match:
-                return match.group(1).zfill(10)
+                cik = normalize_cik(match.group(1))
+                if cik:
+                    return cik
         return None
 
     def _load_issuer_identity(self) -> dict[str, Any]:

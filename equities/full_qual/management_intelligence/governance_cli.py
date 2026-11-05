@@ -250,6 +250,10 @@ def build_governance(
     related_status_with_records["_records"] = related
     coverage = _coverage(ticker, as_of_date, board=board, committees=committees, expertise=expertise, overboarding=overboarding, related_status=related_status_with_records, classes=classes, rights=rights, warnings=warnings)
     eligible_proxies = catalog.primary_sources(ticker)
+    # ``primary_sources`` is intentionally broad so management/governance
+    # parsers can use annual filings and AGM/current reports as supplements.
+    # Keep the proxy diagnostic precise: a generic 10-K/8-K is not a proxy.
+    actual_proxy_sources = [item for item in eligible_proxies if item.is_proxy]
     candidate_rows = [
         row for row in store.list_boards(ticker)
         if (row.board_ticker or row.ticker).upper() == ticker
@@ -270,7 +274,7 @@ def build_governance(
         + (15 if known_independence else 0)
         + (10 if board and all(item.start_date for item in board) else 0)
     )
-    coverage.proxy_sources_eligible = len(eligible_proxies)
+    coverage.proxy_sources_eligible = len(actual_proxy_sources)
     coverage.board_member_candidates = len(candidate_rows)
     coverage.board_members_validated = len(board)
     coverage.board_members_rejected = max(0, len(candidate_rows) - len(board))
@@ -283,8 +287,9 @@ def build_governance(
     coverage.independence_status_known = known_independence
     coverage.governance_completeness_score = completeness_score
     governance_diagnostics = {
-        "GOVERNANCE_PRIMARY_SOURCES": len(eligible_proxies),
-        "PROXY_SOURCES_ELIGIBLE": len(eligible_proxies),
+        "GOVERNANCE_PRIMARY_SOURCES": len(actual_proxy_sources),
+        "PROXY_SOURCES_ELIGIBLE": len(actual_proxy_sources),
+        "GOVERNANCE_SUPPLEMENTAL_SOURCES": max(0, len(eligible_proxies) - len(actual_proxy_sources)),
         "BOARD_MEMBER_CANDIDATES": len(candidate_rows),
         "BOARD_MEMBERS_VALIDATED": len(board),
         "BOARD_MEMBERS_REJECTED": max(0, len(candidate_rows) - len(board)),

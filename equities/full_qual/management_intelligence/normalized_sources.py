@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 from pypdf import PdfReader
+from common.issuer_identity import normalize_cik
 
 from insider_intelligence.models import SECFiling
 
@@ -39,9 +40,9 @@ def _accession(value: str | None, url: str | None) -> str | None:
 def _cik(value: str | None, url: str | None) -> str:
     text = str(value or "")
     if text.isdigit():
-        return text.zfill(10)
+        return normalize_cik(text) or ""
     match = re.search(r"/data/(\d+)/", str(url or ""), re.I)
-    return match.group(1).zfill(10) if match else ""
+    return normalize_cik(match.group(1)) if match else ""
 
 
 def _form(metadata: dict, title: str, source_url: str) -> str | None:

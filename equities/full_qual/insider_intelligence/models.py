@@ -55,6 +55,11 @@ class IssuerIdentity:
     effective_date: str | None = None
     identity_confidence: str = "HIGH"
     lineage_version: str = "issuer-lineage-v1"
+    filing_regime: str | None = None
+    jurisdiction: str | None = None
+    verified_at: str | None = None
+    identity_diagnostics: dict[str, Any] = field(default_factory=dict)
+    resolution_version: str = "issuer-resolution-v2"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

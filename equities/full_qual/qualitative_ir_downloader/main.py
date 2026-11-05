@@ -54,6 +54,7 @@ from .report_accounting import (
 from .acquisition_priority import critical_source_coverage, sort_documents
 from .urls import canonicalize_url
 from .official_sources import OfficialSourceStrategy, SOURCE_NEWSROOM
+from common.issuer_identity import is_valid_cik, normalize_cik
 from .reliability import (
     AcquisitionDeadlineExceeded,
     AcquisitionProgressTimeout,
@@ -66,7 +67,7 @@ _SOURCE_ACCESSION_RE = re.compile(r"(?<!\d)(\d{10})-\d{2}-\d{6}(?!\d)")
 
 def annotate_source_identity(document, *, canonical_cik: str | None, canonical_name: str | None = None):
     """Attach and validate source registrant identity before materialization."""
-    canonical = str(canonical_cik or "").zfill(10) if canonical_cik else None
+    canonical = normalize_cik(canonical_cik)
     document.canonical_registrant_cik = canonical
     document.canonical_registrant_name = canonical_name
     archive_ciks: list[str] = []
@@ -75,21 +76,31 @@ def annotate_source_identity(document, *, canonical_cik: str | None, canonical_n
     for provenance in document.provenance or []:
         accession = str(provenance.get("accession_number") or "")
         if provenance.get("issuer_cik"):
-            provenance_ciks.append(str(provenance["issuer_cik"]).zfill(10))
+            cik = normalize_cik(provenance["issuer_cik"])
+            if cik:
+                provenance_ciks.append(cik)
         for value in (accession, str(provenance.get("source_url") or "")):
             archive = _SOURCE_ARCHIVE_CIK_RE.search(value)
             if archive:
-                archive_ciks.append(archive.group(1).zfill(10))
+                cik = normalize_cik(archive.group(1))
+                if cik:
+                    archive_ciks.append(cik)
             match = _SOURCE_ACCESSION_RE.search(value)
             if match:
-                accession_ciks.append(match.group(1))
+                cik = normalize_cik(match.group(1))
+                if cik:
+                    accession_ciks.append(cik)
     source_url = str(document.source_url or "")
     archive = _SOURCE_ARCHIVE_CIK_RE.search(source_url)
     if archive:
-        archive_ciks.append(archive.group(1).zfill(10))
+        cik = normalize_cik(archive.group(1))
+        if cik:
+            archive_ciks.append(cik)
     match = _SOURCE_ACCESSION_RE.search(source_url)
     if match:
-        accession_ciks.append(match.group(1))
+        cik = normalize_cik(match.group(1))
+        if cik:
+            accession_ciks.append(cik)
     # Filing agents often own the accession prefix (for example 0001193125)
     # while the archive path and issuer metadata identify the registrant. Use
     # the canonical CIK whenever any filing-level evidence matches it.
@@ -338,6 +349,8 @@ async def _save_official_documents(
     return downloader, failed
 
 async def process_company(browser: Browser, stock: Stock, timestamp: str, max_documents: int | None = None, *, scan_only=False, issuer_cik: str | None = None, issuer_resolution_source: str | None = None, as_of_date: str | None = None) -> dict:
+    if issuer_cik is not None and not is_valid_cik(issuer_cik):
+        raise ValueError(f"CANONICAL_REGISTRANT_UNRESOLVED: invalid issuer CIK for {stock.ticker}")
     company_started=time.perf_counter()
     key = (stock.ticker.casefold(), company_key(stock.company_name))
     prepared = getattr(browser, "prepared_companies", {})
@@ -1072,6 +1085,8 @@ async def run(args) -> int:
         if manual_company_name:
             if not args.ticker:
                 raise ValueError("--company-name requires --ticker")
+            if not is_valid_cik(manual_issuer_cik):
+                raise ValueError("CANONICAL_REGISTRANT_UNRESOLVED: --issuer-cik must be a valid SEC CIK")
             # The runner supplies an authoritative issuer identity for an
             # explicit ticker. This path intentionally never reads Sheets.
             stocks = [Stock(args.ticker.upper(), manual_company_name, "manual", 0)]

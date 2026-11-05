@@ -181,30 +181,45 @@ def _coverage_diagnostics(*, documents: list[dict[str, Any]], claims: list[dict[
     conflicts = [{"fiscal_year": key[0], "fiscal_quarter": key[1], "period_type": key[2], "period_ends": sorted(ends)} for key, ends in coordinates.items() if len(ends) > 1]
     if conflicts:
         diagnostics.append({"code": "FISCAL_CALENDAR_INCONSISTENT", "module": "qualitative_normalization", "severity": "CRITICAL", "reason": "A fiscal year/quarter identity maps to multiple period-end dates.", "details": conflicts, "required_action": "Rebuild normalization with filing-header and issuer-calendar precedence."})
-    # Temporal changes must advance one issuer quarter at a time.  The check
-    # uses fiscal labels only after normalized period identities have passed
-    # the period-end conflict test.
+    # Temporal chronology is explicit.  A same-quarter YoY or non-contiguous
+    # fallback is valid when no adjacent quarter exists; only a backwards,
+    # zero-gap, or mixed-basis comparison is an integrity blocker.
     def _quarter_coord(label: Any) -> int | None:
         match = re.search(r"Q([1-4])\s*(?:FY\s*)?(20\d{2}|19\d{2})", str(label or ""), re.I)
         if not match:
             return None
         return int(match.group(2)) * 4 + int(match.group(1))
     sequence_errors = []
+    non_contiguous = []
     for row in temporal_rows or []:
         left, right = _quarter_coord(row.get("from_period")), _quarter_coord(row.get("to_period"))
+        relation = str(row.get("sequence_relation") or "").upper()
+        if relation in {"NON_CONTIGUOUS", "ANNUAL_TO_QUARTER"}:
+            non_contiguous.append({"from_period": row.get("from_period"), "to_period": row.get("to_period"), "sequence_relation": relation, "gap_status": row.get("gap_status")})
+            continue
+        # Same-quarter year-over-year is an intentional, comparable fallback
+        # when an immediately preceding issuer quarter is not yet available.
+        # It is not a discontinuity and therefore must not produce the
+        # non-contiguous warning or a quality-gate penalty.
+        if relation == "SAME_QUARTER_YOY":
+            continue
         if left is not None and right is not None and right - left != 1:
             sequence_errors.append({"from_period": row.get("from_period"), "to_period": row.get("to_period"), "change_id": row.get("change_id")})
     if sequence_errors:
         diagnostics.append({"code": "TEMPORAL_SEQUENCE_INVALID", "module": "temporal_comparison", "severity": "CRITICAL", "reason": "Temporal comparison skipped an issuer quarter or used a non-adjacent quarter sequence.", "details": sequence_errors, "required_action": "Select adjacent issuer reporting quarters before computing changes."})
-    if chosen and temporal_rows:
-        to_periods = [row.get("to_period") for row in temporal_rows if row.get("to_period")]
-        if to_periods and chosen.get("period_label") and str(chosen.get("period_label")) not in {str(item) for item in to_periods}:
-            # Compare by period-end where aliases differ (Q2 FY2027 vs Q2
-            # 2027); a genuine mismatch remains a release blocker.
-            chosen_end = _period_end(chosen)
-            claim_end_by_label = {str(row.get("period_label")): _period_end(row) for row in [*claims, *documents] if row.get("period_label")}
-            if not chosen_end or not any(chosen_end == claim_end_by_label.get(str(label)) for label in to_periods):
-                diagnostics.append({"code": "CURRENT_PERIOD_SELECTION_INVALID", "module": "state_synthesis", "severity": "CRITICAL", "reason": f"State current period {chosen.get('period_label')} does not match the latest temporal comparison period.", "details": {"state_period": chosen.get("period_label"), "temporal_to_periods": to_periods[-5:]}, "required_action": "Rebuild temporal comparison and state synthesis from the same latest issuer period."})
+    if non_contiguous:
+        diagnostics.append({"code": "TEMPORAL_COMPARISON_NON_CONTIGUOUS", "module": "temporal_comparison", "severity": "WARNING", "reason": "The latest comparison uses an explicitly labelled same-quarter YoY or non-contiguous fallback because no adjacent issuer quarter was available.", "details": non_contiguous})
+    # Current-period validity is independent of comparison continuity.  The
+    # state is valid when it matches the latest PIT-eligible actual period by
+    # period end (or canonical label), even if comparison used same-quarter
+    # YoY/non-contiguous fallback.
+    if latest_actual and chosen:
+        latest_end = _period_end(latest_actual)
+        state_end = _period_end(chosen)
+        if latest_end and state_end and latest_end != state_end:
+            diagnostics.append({"code": "CURRENT_PERIOD_SELECTION_INVALID", "module": "state_synthesis", "severity": "CRITICAL", "reason": f"State current period {chosen.get('period_label')} does not match the latest PIT-eligible actual period {latest_actual.get('period_label')}.", "details": {"state_period": chosen.get("period_label"), "latest_actual_period": latest_actual.get("period_label"), "latest_actual_end": latest_end, "state_end": state_end}, "required_action": "Rebuild state synthesis from the latest issuer reporting period."})
+        elif not latest_end and latest_actual.get("period_label") and chosen.get("period_label") != latest_actual.get("period_label"):
+            diagnostics.append({"code": "CURRENT_PERIOD_SELECTION_INVALID", "module": "state_synthesis", "severity": "CRITICAL", "reason": f"State current period {chosen.get('period_label')} does not match the latest PIT-eligible actual period {latest_actual.get('period_label')}.", "details": {"state_period": chosen.get("period_label"), "latest_actual_period": latest_actual.get("period_label")}, "required_action": "Rebuild state synthesis from the latest issuer reporting period."})
     return diagnostics
 
 

@@ -15,6 +15,7 @@ from qualitative_analysis.temporal_comparison import (
     stable_change_id,
     eligible_observed_claims,
 )
+from qualitative_analysis.fiscal_periods import detect_fiscal_period
 from qualitative_analysis.temporal_rules import classify_matched, extract_metric
 from qualitative_analysis.temporal_store import TemporalStore
 from qualitative_analysis.topic_normalization import normalize_topic, topic_identity
@@ -68,6 +69,42 @@ def _claim(
 
 
 class TemporalComparisonTests(unittest.TestCase):
+    def test_non_calendar_q1_after_annual_boundary_uses_same_quarter_yoy(self):
+        prior = _claim("prior", period="Q1 FY2026", year=2026, quarter=1)
+        prior.period_end_date, prior.available_date = "2025-08-02", "2025-09-01"
+        latest = _claim("latest", period="Q1 FY2027", year=2027, quarter=1)
+        latest.period_end_date, latest.available_date = "2026-08-01", "2026-09-02"
+        q3 = _claim("q3", period="Q3 FY2026", year=2026, quarter=3)
+        q3.period_end_date, q3.available_date = "2026-01-31", "2026-03-01"
+        for claim in (prior, latest, q3):
+            claim.issuer_fiscal_calendar = {"calendar_type": "non_calendar", "fiscal_year_end_month": 5, "fiscal_year_end_day": 2}
+        result = compare_latest_vs_previous("ZM", [prior, q3, latest], horizon="quarterly", as_of_date="2026-09-25")
+        self.assertEqual((result.from_period, result.to_period), ("Q1 FY2026", "Q1 FY2027"))
+        self.assertEqual(result.sequence_relation, "SAME_QUARTER_YOY")
+        self.assertEqual(result.period_basis, "QUARTER_ONLY")
+
+    def test_non_contiguous_quarter_is_explicit_not_sequence_blocker(self):
+        prior = _claim("prior", period="Q3 FY2026", year=2026, quarter=3)
+        prior.period_end_date, prior.available_date = "2026-01-31", "2026-03-01"
+        latest = _claim("latest", period="Q1 FY2027", year=2027, quarter=1)
+        latest.period_end_date, latest.available_date = "2026-08-01", "2026-09-02"
+        for claim in (prior, latest):
+            claim.issuer_fiscal_calendar = {"calendar_type": "non_calendar", "fiscal_year_end_month": 5, "fiscal_year_end_day": 2}
+        result = compare_latest_vs_previous("ZM", [prior, latest], horizon="quarterly", as_of_date="2026-09-25")
+        self.assertEqual(result.status, "OK")
+        self.assertEqual(result.sequence_relation, "NON_CONTIGUOUS")
+        self.assertEqual(result.gap_status, "GAP_2_QUARTERS")
+
+    def test_annual_result_header_does_not_create_synthetic_q4(self):
+        period = detect_fiscal_period(
+            {"sec_form": "8-K", "issuer_fiscal_calendar": {"fiscal_year_end_month": 5, "fiscal_year_end_day": 2}},
+            title="Issuer 8-K",
+            body="FORM 8-K\nOn June 1, 2026, the Company announced results for the fiscal year ended May 2, 2026.",
+            document_type="other_report",
+        )
+        self.assertEqual(period.period_type, "ANNUAL_ACTUAL")
+        self.assertIsNone(period.fiscal_quarter)
+        self.assertEqual(period.period_label, "FY 2026")
     def test_pit_excludes_future_period_end_from_latest_quarter(self):
         q1 = _claim("q1", period="Q1 2026", year=2026, quarter=1)
         q1.period_end_date, q1.available_date = "2026-03-31", "2026-05-01"

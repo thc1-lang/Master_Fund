@@ -51,7 +51,7 @@ class ManualTickerResolutionTests(unittest.TestCase):
 
         metadata = {
             "spreadsheet_id": "fixture",
-            "stocks": {"ACME": {"ticker": "ACME", "company_name": "Acme Holdings", "worksheet": "Safe", "spreadsheet_row": 7}},
+            "stocks": {"ACME": {"ticker": "ACME", "company_name": "Acme Holdings", "issuer_cik": "0000000001", "worksheet": "Safe", "spreadsheet_row": 7}},
         }
         self.download.mkdir(parents=True)
         (self.download / "stock_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
@@ -70,12 +70,24 @@ class ManualTickerResolutionTests(unittest.TestCase):
         self.assertEqual(authoritative.company_name, "ACME CORP")
         self.assertEqual(authoritative.worksheet, "Safe")
 
+    def test_name_only_worksheet_metadata_cannot_authorize_acquisition(self):
+        class FailingProvider:
+            def resolve_issuer(self, ticker):
+                raise LookupError("offline")
+
+        self.download.mkdir(parents=True)
+        (self.download / "stock_metadata.json").write_text(json.dumps({
+            "stocks": {"ACME": {"ticker": "ACME", "company_name": "Acme Holdings", "worksheet": "Safe"}},
+        }), encoding="utf-8")
+        with self.assertRaisesRegex(IssuerResolutionError, "CANONICAL_REGISTRANT_UNRESOLVED"):
+            resolve_issuer_metadata("ACME", download_root=self.download, data_root=self.data, sec_provider=FailingProvider())
+
     def test_unresolvable_manual_ticker_is_explicit(self):
         class FailingProvider:
             def resolve_issuer(self, ticker):
                 raise LookupError("not found")
 
-        with self.assertRaisesRegex(IssuerResolutionError, "ISSUER_RESOLUTION_FAILED"):
+        with self.assertRaisesRegex(IssuerResolutionError, "CANONICAL_REGISTRANT_UNRESOLVED"):
             resolve_issuer_metadata("NOT_A_REAL_TICKER", download_root=self.download, data_root=self.data, sec_provider=FailingProvider())
 
     def test_runner_reports_resolution_failure_before_acquisition(self):

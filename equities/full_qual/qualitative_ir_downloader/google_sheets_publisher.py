@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from common.issuer_identity import canonical_identity_hash
+from common.issuer_identity import canonical_identity_hash, normalize_cik
 
 log = logging.getLogger(__name__)
 
@@ -5240,12 +5240,12 @@ def build_canonical_state(dossier: str | Path | Mapping[str, Any], *, ticker: st
         if isinstance(authoritative, Mapping):
             expected_name = str(authoritative.get("legal_name") or authoritative.get("company_name") or "").strip().casefold()
             actual_name = str(payload.get("company_name") or handoff.get("legal_name") or "").strip().casefold()
-            expected_cik = str(authoritative.get("issuer_cik") or authoritative.get("cik") or "")
-            actual_cik = str(handoff.get("issuer_cik") or payload.get("issuer_cik") or "")
+            expected_cik = normalize_cik(authoritative.get("issuer_cik") or authoritative.get("cik"))
+            actual_cik = normalize_cik(handoff.get("issuer_cik") or payload.get("issuer_cik"))
             expected_hash = str(authoritative.get("identity_hash") or "")
             actual_hash = str(handoff.get("identity_hash") or payload.get("identity_hash") or "")
             if ((expected_name and actual_name and expected_name != actual_name)
-                    or (expected_cik and actual_cik and expected_cik != actual_cik)
+                    or (expected_cik and actual_cik != expected_cik)
                     or (expected_hash and actual_hash and expected_hash != actual_hash)):
                 handoff.setdefault("diagnostics", {})["issuer_identity_valid"] = False
                 handoff["diagnostics"]["issuer_identity_mismatch"] = {"expected": dict(authoritative), "actual_company_name": payload.get("company_name"), "actual_issuer_cik": actual_cik}

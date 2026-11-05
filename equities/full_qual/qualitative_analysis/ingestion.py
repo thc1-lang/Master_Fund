@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
+from common.issuer_identity import normalize_cik
 
 from .models import IngestionFailure, NormalizedDocument
 from .normalization import build_normalized_document, classify_document, normalize_whitespace
@@ -27,7 +28,10 @@ _SOURCE_ARCHIVE_CIK_RE = re.compile(r"/Archives/edgar/data/(\d{1,10})/", re.I)
 
 def _reconcile_source_identity(metadata: dict[str, Any], canonical_cik: str | None) -> None:
     """Annotate and gate a normalized source against the canonical issuer."""
-    canonical = str(canonical_cik or "").strip().zfill(10) if canonical_cik else ""
+    canonical = normalize_cik(canonical_cik) if canonical_cik is not None else None
+    if canonical_cik is not None and not canonical:
+        raise ValueError("CANONICAL_REGISTRANT_UNRESOLVED")
+    canonical = canonical or ""
     if not canonical:
         return
     provenance = metadata.get("provenance")
@@ -44,8 +48,9 @@ def _reconcile_source_identity(metadata: dict[str, Any], canonical_cik: str | No
         value = item.get("issuer_cik") or item.get("cik") or item.get("source_registrant_cik")
         if value:
             digits = re.sub(r"\D", "", str(value))
-            if digits:
-                candidates.append(digits.zfill(10))
+            cik = normalize_cik(digits)
+            if cik:
+                candidates.append(cik)
     for key in ("accession_number", "source_url", "official_ir_url", "event_url", "artifact_url"):
         value = metadata.get(key)
         if value:
@@ -56,10 +61,14 @@ def _reconcile_source_identity(metadata: dict[str, Any], canonical_cik: str | No
     for value in urls:
         archive = _SOURCE_ARCHIVE_CIK_RE.search(value)
         if archive:
-            archive_ciks.append(archive.group(1).zfill(10))
+            cik = normalize_cik(archive.group(1))
+            if cik:
+                archive_ciks.append(cik)
         accession = _SOURCE_ACCESSION_RE.search(value)
         if accession:
-            accession_ciks.append(accession.group(1))
+            cik = normalize_cik(accession.group(1))
+            if cik:
+                accession_ciks.append(cik)
     # Some SEC filings are submitted by a filing agent: the first ten digits
     # of the accession then differ from the registrant CIK in the archive path.
     # When canonical identity is available, matching either evidence source is
@@ -74,7 +83,7 @@ def _reconcile_source_identity(metadata: dict[str, Any], canonical_cik: str | No
         source_cik = accession_ciks[0]
     if not source_cik and candidates:
         source_cik = candidates[0]
-    source_cik = source_cik.zfill(10) if source_cik else ""
+    source_cik = normalize_cik(source_cik) if source_cik else ""
     metadata["canonical_registrant_cik"] = canonical
     metadata["source_registrant_cik"] = source_cik or canonical
     metadata["source_lineage_relation"] = "CANONICAL_REGISTRANT" if not source_cik or source_cik == canonical else "AFFILIATE"

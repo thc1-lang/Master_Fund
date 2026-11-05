@@ -391,6 +391,53 @@ def extract_committees(
         layout_text = ""
     table_source = layout_text or text
     html_matrix_rows = _html_committee_matrix(proxy.html or "", people_list)
+
+    # Plain-text SEC proxies often retain the entire committee matrix as one
+    # row per director (``Name Audit Compensation NCG``).  Parse that explicit
+    # matrix before narrative fallbacks; membership is accepted only for
+    # ``Member``/``Chair`` cells and never inferred from a committee heading.
+    matrix_match = re.search(
+        r"Committee\s+membership\s+as\s+of\s+the\s+Record\s+Date\s+was\s+as\s+follows:\s*"
+        r"(?P<section>.*?)(?:Our\s+Board\s+has\s+adopted\s+written\s+charters|Audit\s+Committee\b)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if matrix_match:
+        section = matrix_match.group("section")
+        aliases = (
+            ("audit", "Audit Committee"),
+            ("compensation", "Compensation Committee"),
+            ("nominating_governance", "Nominating and Corporate Governance Committee"),
+        )
+        for line in (" ".join(str(item or "").split()) for item in section.splitlines()):
+            row = re.match(r"^(?P<name>[A-Za-z][A-Za-z'(). -]{2,80}?)\s+(?P<audit>—|-|Member|Chair)\s+(?P<comp>—|-|Member|Chair)\s+(?P<ncg>—|-|Member|Chair)\s*$", line, re.I)
+            if not row:
+                continue
+            person_ids = _person_ids(row.group("name"), people_list)
+            if not person_ids:
+                continue
+            person_id = person_ids[0]
+            for key, committee_name, cell in zip(("audit", "compensation", "nominating_governance"), ("Audit Committee", "Compensation Committee", "Nominating and Corporate Governance Committee"), (row.group("audit"), row.group("comp"), row.group("ncg"))):
+                if cell.strip() in {"—", "-"}:
+                    continue
+                committee = next((item for item in result if item.committee_type == key), None)
+                if committee is None:
+                    committee = BoardCommittee(
+                        committee_id=f"governance-committee:{ticker.upper()}:{key}:{re.sub(r'[^a-z0-9]+','-',committee_name.lower()).strip('-')}",
+                        ticker=ticker.upper(), committee_type=key, committee_name=committee_name,
+                        source_url=proxy.source_url, source_accession=proxy.accession_number, source_form=proxy.form_type,
+                        source_date=proxy.filing_date, local_source_path=proxy.local_path,
+                        required_independence="UNKNOWN", source_status="AVAILABLE", membership_status="AVAILABLE",
+                        evidence_text=f"SEC proxy committee matrix: {line}",
+                    )
+                    result.append(committee)
+                if person_id not in committee.members:
+                    committee.members.append(person_id)
+                committee.member_independence[person_id] = member_map.get(person_id).is_independent if person_id in member_map else "UNKNOWN"
+                if cell.strip().lower() == "chair":
+                    committee.chair_person_id = person_id
+                committee.evidence_text = (committee.evidence_text + "\n" + line).strip()
+
     # Director profiles in flattened SEC/PDF proxies retain a compact,
     # explicit ``Board Committees`` block even when the cross-board matrix
     # loses its cell markers.  Recover those assignments from bounded profile

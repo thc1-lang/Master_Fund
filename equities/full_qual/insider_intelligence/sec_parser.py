@@ -7,6 +7,7 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
+from common.issuer_identity import normalize_cik
 
 from .models import (
     PARSER_VERSION,
@@ -130,9 +131,11 @@ def _row_footnotes(row, footnote_map: dict[str, str]) -> list[str]:
 def _issuer(root, filing: SECFiling) -> tuple[str, str, str]:
     issuer = _first(root, "issuer")
     name = _value(issuer, "issuerName") or ""
-    cik = _value(issuer, "issuerCik") or filing.issuer_cik
+    cik = normalize_cik(_value(issuer, "issuerCik") or filing.issuer_cik)
+    if not cik:
+        raise ValueError("CANONICAL_REGISTRANT_UNRESOLVED")
     ticker = _value(issuer, "issuerTradingSymbol") or filing.ticker
-    return name, ticker, cik.zfill(10)
+    return name, ticker, cik
 
 
 def _owner(root, filing: SECFiling) -> tuple[str, str | None, dict[str, str | bool | None], list[str]]:

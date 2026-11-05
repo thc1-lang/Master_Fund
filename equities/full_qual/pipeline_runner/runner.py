@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from .models import AcquisitionResult, PipelineRunResult, StageResult, StageStatus
 from .issuer_resolution import IssuerMetadata, IssuerResolutionError, resolve_issuer_metadata
+from common.issuer_identity import is_valid_cik, normalize_cik
 from .compatibility import (ArtifactCompatibilityStore, CompatibilityDecision,
                             STAGE_CONTRACTS, configuration_fingerprint,
                             canonical_artifact_fingerprint, dependency_fingerprint,
@@ -282,9 +283,10 @@ class PipelineRunner:
             "--as-of-date", self.as_of_date,
         ]
         if issuer is not None:
+            if not is_valid_cik(issuer.cik):
+                raise IssuerResolutionError(f"CANONICAL_REGISTRANT_UNRESOLVED: {self.ticker} has no valid canonical CIK")
             args.extend(["--company-name", issuer.company_name])
-            if issuer.cik:
-                args.extend(["--issuer-cik", issuer.cik])
+            args.extend(["--issuer-cik", normalize_cik(issuer.cik)])
         return MODULES["acquisition"], args
 
     def _resolve_manual_issuer(self) -> IssuerMetadata:
@@ -311,10 +313,13 @@ class PipelineRunner:
         if path.exists():
             try:
                 previous = json.loads(path.read_text(encoding="utf-8"))
-                previous_cik = str(previous.get("issuer_cik") or previous.get("sec_registrant_cik") or "").zfill(10)
-                current_cik = str(self._issuer_metadata.cik or "").zfill(10)
+                previous_raw_cik = previous.get("issuer_cik") or previous.get("sec_registrant_cik")
+                previous_cik = normalize_cik(previous_raw_cik)
+                current_cik = normalize_cik(self._issuer_metadata.cik)
                 previous_hash = str(previous.get("identity_hash") or "")
-                if previous_cik and current_cik and previous_cik != current_cik:
+                if previous_raw_cik is not None and not previous_cik and current_cik:
+                    self._canonical_identity_changed = True
+                elif previous_cik and current_cik and previous_cik != current_cik:
                     self._canonical_identity_changed = True
                 elif previous_hash and previous_hash != self._issuer_metadata.identity_hash:
                     self._canonical_identity_changed = True

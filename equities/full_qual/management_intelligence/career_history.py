@@ -629,6 +629,59 @@ def _plain_text_proxy_roster(
             evidence = f"Flattened split-name proxy row: {name} | {tail} | age {match.group('age')} | director since {match.group('since')}"
             add(name, role, board=True, is_current=current_nominees or not bool(re.search(r"nominee", section, re.I)), evidence=evidence, board_status="CURRENT" if current_nominees else "NOMINEE")
 
+    def _flat_position_roster() -> None:
+        """Parse the common SEC ``Name Age Position Class Director Since`` grid.
+
+        PDF/plain-text materialization removes the table cells but preserves
+        one complete row per line.  The header and the age/class/year
+        boundary make this a source-bounded parse; no issuer names are
+        embedded in the rule.
+        """
+        header = re.search(
+            r"(?im)^\s*Name\s+Age(?:\(\d+\))?\s+Position\(s\)\s+Class\s+Director\s+Since\s*$",
+            text,
+        )
+        if not header:
+            return
+        tail = text[header.end():]
+        stop = re.search(r"(?im)^\s*(?:Board\s+Skills|Board\s+Experience|Biographical\s+Information|Corporate\s+Governance)\b", tail)
+        section = tail[:stop.start()] if stop else tail[:12000]
+        row_pattern = re.compile(
+            r"^(?P<name>.+?)\s+(?P<age>\d{2})\s+(?P<role>.+?)\s+(?P<class>[IVX]{1,4})\s+(?P<since>(?:19|20)\d{2})\s*$",
+            re.I,
+        )
+        for line in (_clean(item) for item in section.splitlines()):
+            match = row_pattern.fullmatch(line)
+            if not match:
+                continue
+            name = _clean(match.group("name"))
+            role = _clean(match.group("role"))
+            if not _looks_like_name(name) or not re.search(r"\b(?:director|ceo|cfo|chief|president|officer|independent|chair)\b", role, re.I):
+                continue
+            evidence = f"SEC proxy board roster: {name} | {role} | age {match.group('age')} | class {match.group('class')} | director since {match.group('since')}"
+            add(name, role if "director" in role.lower() else f"{role} and Director", board=True, evidence=evidence, board_status="CURRENT")
+
+    def _flat_executive_officer_roster() -> None:
+        """Parse an explicit ``Executive Officers of the Company`` table."""
+        heading = re.search(r"(?im)^\s*Executive\s+Officers\s+of\s+the\s+Company\s*$", text)
+        if not heading:
+            return
+        tail = text[heading.end():]
+        stop = re.search(r"(?im)^\s*Biographical\s+information\s+for\s+each\b", tail)
+        section = tail[:stop.start()] if stop else tail[:8000]
+        row_pattern = re.compile(
+            r"^(?P<name>.+?)\s+(?P<role>(?:President|Chief|CEO|CFO|COO|CTO|Vice\s+President|General\s+Counsel|Chief\s+Legal\s+Officer|Secretary|Treasurer)\b.+)$",
+            re.I,
+        )
+        for line in (_clean(item) for item in section.splitlines()):
+            match = row_pattern.fullmatch(line)
+            if not match:
+                continue
+            name, role = _clean(match.group("name")), _clean(match.group("role"))
+            if not _looks_like_name(name):
+                continue
+            add(name, role, board=bool(re.search(r"\bdirector\b", role, re.I)), evidence=f"SEC proxy executive officer roster: {name} | {role}")
+
     nominees = re.search(
         r"nominees?\s+as\s+directors?:\s*(?P<names>.+?)(?:\.\s*(?:FOR|Your\s+board)\b)",
         text, re.I,
@@ -900,6 +953,8 @@ def _plain_text_proxy_roster(
     _flat_director_since_roster()
     _flat_sec_roster()
     _flat_split_name_table()
+    _flat_position_roster()
+    _flat_executive_officer_roster()
     if not result.boards:
         _narrative_nominee_roster()
     if not result.boards:
@@ -1674,6 +1729,15 @@ def parse_proxy_people(html: str | bytes, filing: SECFiling, company_name: str) 
                 evidence_text=match.group(0),
                 source_ids=[source.source_id],
             ))
+    result.diagnostics.update({
+        "SOURCE_ACCESSION": filing.accession_number,
+        "SOURCE_FORM": filing.form_type.upper(),
+        "SECTION_CANDIDATES": len(re.findall(r"(?:director\s+nominees?|executive\s+officers?|management|leadership)", html.decode("utf-8", errors="replace") if isinstance(html, bytes) else str(html or ""), re.I)),
+        "TABLES_INSPECTED": len(soup.find_all("table")),
+        "PEOPLE_CANDIDATES": len(by_key),
+        "PEOPLE_VALIDATED": len(result.people),
+        "REJECTION_REASONS": [] if result.people else ["NO_EXPLICIT_ROLE_BOUNDARY_MATCH"],
+    })
     if not result.people:
         result.warnings.append(f"No structured management rows found in {filing.accession_number}")
     # Deduplicate rows produced by split proxy tables deterministically.

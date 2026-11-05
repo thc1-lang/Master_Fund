@@ -46,6 +46,43 @@ def compatible_period_types(left: Any, right: Any) -> bool:
     return left_type == right_type and left_type in ACTUAL_PERIOD_TYPES
 
 
+def period_basis(value: Any) -> str:
+    """Return the economic basis of a reporting period, never infer Q4."""
+    explicit = str(getattr(value, "period_basis", "") or "").upper()
+    if explicit in {"QUARTER_ONLY", "YTD", "ANNUAL", "TTM", "INTERIM"}:
+        return explicit
+    kind = period_type(value)
+    return {
+        "QUARTER_ACTUAL": "QUARTER_ONLY",
+        "YTD_ACTUAL": "YTD",
+        "ANNUAL_ACTUAL": "ANNUAL",
+    }.get(kind, "UNKNOWN")
+
+
+def comparison_sequence_relation(previous: Any, current: Any) -> tuple[str, str]:
+    """Classify chronology separately from current-period validity."""
+    left_type, right_type = period_type(previous), period_type(current)
+    if left_type not in ACTUAL_PERIOD_TYPES or right_type not in ACTUAL_PERIOD_TYPES:
+        return "INSUFFICIENT_COMPARABLE_PERIODS", "UNKNOWN"
+    if left_type != right_type:
+        if {left_type, right_type} == {"ANNUAL_ACTUAL", "QUARTER_ACTUAL"}:
+            return "ANNUAL_TO_QUARTER", "MIXED_PERIOD_BASIS"
+        return "INSUFFICIENT_COMPARABLE_PERIODS", "MIXED_PERIOD_BASIS"
+    if left_type != "QUARTER_ACTUAL":
+        return "CONTIGUOUS_QUARTER" if left_type == "YTD_ACTUAL" else "SAME_QUARTER_YOY", "NOT_APPLICABLE"
+    left_key, right_key = period_sort_key(previous), period_sort_key(current)
+    left_coord = int(left_key[0]) * 4 + int(left_key[1])
+    right_coord = int(right_key[0]) * 4 + int(right_key[1])
+    gap = right_coord - left_coord
+    if gap == 1:
+        return "CONTIGUOUS_QUARTER", "CONTIGUOUS"
+    if right_key[1] == left_key[1] and int(right_key[0]) - int(left_key[0]) == 1:
+        return "SAME_QUARTER_YOY", "YEAR_OVER_YEAR"
+    if gap > 1:
+        return "NON_CONTIGUOUS", f"GAP_{gap}_QUARTERS"
+    return "INSUFFICIENT_COMPARABLE_PERIODS", "NON_FORWARD_SEQUENCE"
+
+
 def claims_available_as_of(claims: Sequence[QualitativeClaim], as_of_date: str | None) -> list[QualitativeClaim]:
     """Admit known evidence only when its availability is on/before cutoff.
 
@@ -354,7 +391,28 @@ def _select_latest_vs_previous(claims: Sequence[QualitativeClaim], horizon: str 
     available = _available_period_labels(ordered)
     if len(ordered) < 2:
         return None
-    return ordered[-2][1], ordered[-1][1], available
+    # Prefer a genuinely adjacent issuer quarter.  When the issuer has no
+    # standalone Q4 (the normal 10-K/10-Q pattern), prefer same-quarter YoY
+    # over silently treating Q3 FYx -> Q1 FY(x+1) as sequential.
+    latest_key, latest_values = ordered[-1]
+    previous_values = ordered[-2][1]
+    if period_type(latest_values[0]) == "QUARTER_ACTUAL":
+        latest_coord = int(latest_key[0]) * 4 + int(latest_key[1])
+        adjacent = next(
+            (values for key, values in reversed(ordered[:-1]) if int(latest_coord - (int(key[0]) * 4 + int(key[1]))) == 1),
+            None,
+        )
+        if adjacent is not None:
+            previous_values = adjacent
+        else:
+            latest_year, latest_quarter = int(latest_key[0]), int(latest_key[1])
+            yoy = next(
+                (values for key, values in reversed(ordered[:-1]) if int(key[1]) == latest_quarter and int(key[0]) == latest_year - 1),
+                None,
+            )
+            if yoy is not None:
+                previous_values = yoy
+    return previous_values, latest_values, available
 
 
 def select_latest_vs_previous(
@@ -460,6 +518,7 @@ def _make_change(previous: list[QualitativeClaim], current: list[QualitativeClai
         rules_version=RULES_VERSION,
         provider=PROVIDER_VERSION,
         comparison_horizon=comparison_horizon,
+        period_basis=period_basis(anchor),
     )
 
 
@@ -602,20 +661,19 @@ def compare_latest_vs_previous(
     # eligible groups, not from all period-like labels in the claim store.
     eligible_labels = available
     integrity_failures: list[str] = []
-    if period_type(previous[0]) == period_type(current[0]) == "QUARTER_ACTUAL":
-        previous_key, current_key = period_sort_key(previous[0]), period_sort_key(current[0])
-        previous_coord = int(previous_key[0]) * 4 + int(previous_key[1])
-        current_coord = int(current_key[0]) * 4 + int(current_key[1])
-        if current_coord - previous_coord != 1:
-            integrity_failures.append("TEMPORAL_SEQUENCE_INVALID")
-            return TemporalComparisonResult(
-                ticker=ticker.upper(), status="TEMPORAL_SEQUENCE_INVALID", comparison_status="TEMPORAL_SEQUENCE_INVALID",
-                available_periods=available, from_period=period_label(previous), to_period=period_label(current),
-                previous_claims=len(previous), current_claims=len(current), comparison_horizon=horizon or "quarterly",
-                candidates_generated=len(current), records_rejected=len(current), period_integrity_failures=integrity_failures,
-                as_of_date=as_of_date, eligible_periods=eligible_labels,
-                excluded_periods=eligibility.get("excluded_periods", []), period_diagnostics=eligibility,
-            )
+    relation, gap_status = comparison_sequence_relation(previous[0], current[0])
+    basis = period_basis(current[0])
+    if relation == "INSUFFICIENT_COMPARABLE_PERIODS":
+        integrity_failures.append("TEMPORAL_SEQUENCE_INVALID")
+        return TemporalComparisonResult(
+            ticker=ticker.upper(), status="TEMPORAL_SEQUENCE_INVALID", comparison_status="TEMPORAL_SEQUENCE_INVALID",
+            available_periods=available, from_period=period_label(previous), to_period=period_label(current),
+            previous_claims=len(previous), current_claims=len(current), comparison_horizon=horizon or "quarterly",
+            candidates_generated=len(current), records_rejected=len(current), period_integrity_failures=integrity_failures,
+            as_of_date=as_of_date, eligible_periods=eligible_labels,
+            excluded_periods=eligibility.get("excluded_periods", []), period_diagnostics=eligibility,
+            period_basis=basis, sequence_relation=relation, gap_status=gap_status,
+        )
     if not compatible_period_types(previous[0], current[0]):
         return TemporalComparisonResult(
             ticker=ticker.upper(), status="NOT_COMPARABLE_PERIOD_TYPES", comparison_status="NOT_COMPARABLE_PERIOD_TYPES",
@@ -631,6 +689,9 @@ def compare_latest_vs_previous(
     result.excluded_periods = eligibility.get("excluded_periods", [])
     result.period_diagnostics = eligibility
     result.comparison_horizon = resolved_horizon
+    result.period_basis = basis
+    result.sequence_relation = relation
+    result.gap_status = gap_status
     result.candidates_generated = len(current)
     result.records_accepted = len(result.changes)
     result.records_rejected = len(result.rejected)
@@ -643,6 +704,9 @@ def compare_latest_vs_previous(
     result.period_integrity_failures.extend(integrity_failures)
     for change in result.changes:
         change.comparison_horizon = resolved_horizon
+        change.period_basis = basis
+        change.sequence_relation = relation
+        change.gap_status = gap_status
     return result
 
 

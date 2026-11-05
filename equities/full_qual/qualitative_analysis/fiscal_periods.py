@@ -389,6 +389,17 @@ def _filing_header(
         r"(?:[A-Z]+\s+\d{1,2},?\s+20\d{2}|\d{1,2}[/-]\d{1,2}[/-]20\d{2})", re.I,
     )
     match = pattern.search(value)
+    # Annual-result 8-Ks and earnings releases commonly carry a fiscal-year
+    # end date but no standalone quarter header. Treating that date as Q4 by
+    # deriving a quarter from the issuer calendar creates a synthetic Q4
+    # observation and can make the next Q1 look like a normal Q3->Q1 jump.
+    # Keep the annual/quarter distinction explicit: a quarter header wins;
+    # otherwise an annual header is an ANNUAL_ACTUAL period.
+    annual_match = re.search(
+        r"\b(?:FOR\s+THE\s+)?(?:FISCAL\s+YEAR|YEAR)\s+ENDED\s+"
+        r"(?:[A-Z]+\s+\d{1,2},?\s+20\d{2}|\d{1,2}[/-]\d{1,2}[/-]20\d{2})",
+        value[:5000], re.I,
+    )
     # SEC-rendered headers occasionally insert ``Commission file`` or a
     # table-cell break between ``period ended`` and the date.  Resolve that
     # bounded header form before scanning the body, where comparative dates
@@ -408,6 +419,25 @@ def _filing_header(
         header_end = match.end() if match else 0
     if not period_end:
         return None
+    if match is None and annual_match is not None:
+        annual_end_text = annual_match.group(0)
+        period_end = _date_from_parts(_date_parts(annual_end_text)) or period_end
+        calendar = _fiscal_calendar(metadata, value)
+        year = _fiscal_year_for_date(period_end, calendar)
+        if year is not None:
+            return _period(
+                year=year,
+                quarter=None,
+                label=f"FY {year}",
+                method="filing_header",
+                confidence=1.0,
+                period_type=PERIOD_ANNUAL_ACTUAL,
+                evidence=annual_end_text,
+                sources=["document_type", "filing_header", "issuer_fiscal_calendar"],
+                period_end_date=period_end,
+                period_start_date=_period_start_date(period_end, calendar, None, PERIOD_ANNUAL_ACTUAL),
+                issuer_fiscal_calendar=_calendar_dict(calendar),
+            )
     calendar = _fiscal_calendar(metadata, value)
     derived_year = _fiscal_year_for_date(period_end, calendar)
     derived_quarter = _quarter_from_end_date(period_end, calendar)

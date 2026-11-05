@@ -106,6 +106,12 @@ class TemporalChange:
     model_version: str | None = None
     temporal_version: str = "temporal-comparison-v3"
     comparison_horizon: str = "unknown"
+    # Explicit comparison semantics.  These fields prevent a defensible
+    # same-quarter YoY/non-contiguous fallback from being mistaken for an
+    # adjacent-quarter sequence.
+    period_basis: str = "UNKNOWN"
+    sequence_relation: str = "UNKNOWN"
+    gap_status: str = "UNKNOWN"
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -126,6 +132,9 @@ class TemporalChange:
         data.setdefault("model_version", None)
         data.setdefault("temporal_version", "temporal-comparison-v3")
         data.setdefault("comparison_horizon", "unknown")
+        data.setdefault("period_basis", "UNKNOWN")
+        data.setdefault("sequence_relation", "UNKNOWN")
+        data.setdefault("gap_status", "UNKNOWN")
         return cls(**data)
 
 
@@ -165,3 +174,6 @@ class TemporalComparisonResult:
     eligible_periods: list[str] = field(default_factory=list)
     excluded_periods: list[dict[str, str]] = field(default_factory=list)
     period_diagnostics: dict[str, Any] = field(default_factory=dict)
+    period_basis: str = "UNKNOWN"
+    sequence_relation: str = "INSUFFICIENT_COMPARABLE_PERIODS"
+    gap_status: str = "UNKNOWN"

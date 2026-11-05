@@ -284,6 +284,9 @@ def _run_comparison(args, claim_store: ExtractionStore) -> int:
     for horizon, candidate in (("quarterly", quarterly), ("annual", annual)):
         comparisons[horizon] = {
             "status": candidate.status, "from_period": candidate.from_period, "to_period": candidate.to_period,
+            "period_basis": candidate.period_basis,
+            "sequence_relation": candidate.sequence_relation,
+            "gap_status": candidate.gap_status,
             "available_periods": candidate.available_periods, "changes": len(candidate.changes),
             "as_of_date": candidate.as_of_date,
             "eligible_periods": candidate.eligible_periods,
@@ -291,8 +294,8 @@ def _run_comparison(args, claim_store: ExtractionStore) -> int:
             "period_diagnostics": candidate.period_diagnostics,
         }
     summary["comparison_horizons"] = comparisons
-    summary["latest_quarterly_comparison"] = {"from_period": quarterly.from_period, "to_period": quarterly.to_period, "status": quarterly.status}
-    summary["latest_annual_comparison"] = {"from_period": annual.from_period, "to_period": annual.to_period, "status": annual.status}
+    summary["latest_quarterly_comparison"] = {"from_period": quarterly.from_period, "to_period": quarterly.to_period, "status": quarterly.status, "period_basis": quarterly.period_basis, "sequence_relation": quarterly.sequence_relation, "gap_status": quarterly.gap_status}
+    summary["latest_annual_comparison"] = {"from_period": annual.from_period, "to_period": annual.to_period, "status": annual.status, "period_basis": annual.period_basis, "sequence_relation": annual.sequence_relation, "gap_status": annual.gap_status}
     if result.status == "INSUFFICIENT_PERIODS":
         _print_comparison(summary)
         print("INSUFFICIENT_PERIODS")

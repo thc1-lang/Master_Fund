@@ -14,6 +14,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
 from pypdf import PdfReader
+from common.issuer_identity import normalize_cik
 
 from insider_intelligence.models import SECFiling
 from qualitative_analysis.extraction_safety import safe_text
@@ -160,7 +161,7 @@ class GovernanceSourceCatalog:
                 except OSError:
                     continue
                 accession = filing_dir.name
-                cik = str(metadata.get("issuer_cik") or metadata.get("cik") or "")
+                cik = normalize_cik(metadata.get("issuer_cik") or metadata.get("cik")) or ""
                 url = str(metadata.get("source_url") or self._url_for(ticker, accession, path.name, cik))
                 actual_form = form or str(metadata.get("form_type") or "UNKNOWN")
                 result.append(CachedGovernanceSource(ticker.upper(), accession, actual_form, metadata.get("filing_date"), metadata.get("report_date"), url, str(path), text, extraction_status=extraction_status, extraction_error=None if extraction_status == "VERIFIED" else "RAW_OR_BINARY_SOURCE", html=raw if path.suffix.lower() in {".htm", ".html"} else None, source_role=source_role(form_type=actual_form, text=text)))

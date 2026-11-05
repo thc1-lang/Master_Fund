@@ -23,6 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
+from common.issuer_identity import is_valid_cik, normalize_cik as _normalize_cik
 from .models import IssuerIdentity, SECIngestionResult, SECParsedFiling, SECFiling
 from .sec_parser import parse_ownership_xml
 from .source_registry import SourceRegistry
@@ -37,6 +38,7 @@ SEC_ACCEPT = "application/json,text/xml,application/xml,text/html,*/*"
 SEC_ACCEPT_ENCODING = "gzip, deflate"
 DEFAULT_FORMS = ("3", "4", "5")
 SUPPORTED_FORMS = {"3", "4", "5", "DEF 14A", "DEFA14A", "10-K", "SC 13D", "SC 13G", "SCHEDULE 13D", "SCHEDULE 13G"}
+SEC_JURISDICTION_CODES = {"E9": "Cayman Islands"}
 
 
 def is_ownership_form(form_type: str | None) -> bool:
@@ -92,10 +94,22 @@ class UrllibSECTransport:
 
 
 def normalize_cik(value: str | int) -> str:
-    digits = re.sub(r"\D", "", str(value))
-    if not digits:
+    normalized = _normalize_cik(value)
+    if normalized is None:
         raise ValueError("CIK is required")
-    return digits.zfill(10)
+    return normalized
+
+
+def _normalize_exchange(value: str | None) -> str | None:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    folded = text.casefold()
+    if "nasdaq" in folded:
+        return "NASDAQ"
+    if "new york stock exchange" in folded or folded == "nyse":
+        return "NYSE"
+    if "nyse american" in folded:
+        return "NYSE AMERICAN"
+    return text or None
 
 
 def accession_directory(accession: str) -> str:
@@ -262,15 +276,15 @@ class SECSourceProvider:
         matches = []
         values = data.values() if isinstance(data, dict) else data
         for item in values:
-            if str(item.get("ticker", "")).upper() == symbol:
+            if isinstance(item, dict) and str(item.get("ticker", "")).upper() == symbol and is_valid_cik(item.get("cik_str") or item.get("cik")):
                 matches.append(item)
         if not matches:
             raise LookupError(f"SEC issuer not found for ticker {symbol}")
+        # The ticker registry is the primary issuer anchor.  The exchange
+        # registry is consulted as a security-level cross-check, not as a
+        # name-based replacement.  A conflicting CIK is retained as a
+        # diagnostic rather than silently allowing a brand-like name to win.
         item = matches[0]
-        # A stale company_tickers cache can briefly point at a related
-        # holding/company-action entity.  When the selected name signals that
-        # ambiguity, consult SEC's security-level ticker/exchange registry;
-        # ordinary issuers retain the single-request legacy path.
         security_item = None
         if re.search(r"\b(?:holding|holdings|subsidiary|acquisition|merger)\b", str(item.get("title") or item.get("name") or ""), re.I):
             try:
@@ -278,21 +292,88 @@ class SECSourceProvider:
                 exchange_payload = self._json(SEC_TICKERS_EXCHANGE, cache_path=exchange_cache, force=force)
                 rows = exchange_payload.get("data") if isinstance(exchange_payload, dict) and isinstance(exchange_payload.get("data"), list) else exchange_payload
                 if isinstance(rows, list):
-                    security_item = next((row for row in rows if isinstance(row, dict) and str(row.get("ticker") or "").upper() == symbol), None)
+                    fields = [str(value) for value in (exchange_payload.get("fields") or [])] if isinstance(exchange_payload, dict) else []
+                    normalized_rows = []
+                    for row in rows:
+                        if isinstance(row, dict):
+                            normalized_rows.append(row)
+                        elif isinstance(row, (list, tuple)) and fields:
+                            normalized_rows.append(dict(zip(fields, row)))
+                    candidates = [row for row in normalized_rows if str(row.get("ticker") or "").upper() == symbol and is_valid_cik(row.get("cik") or row.get("cik_str"))]
+                    primary_cik = normalize_cik(item.get("cik_str") or item.get("cik"))
+                    security_item = next((row for row in candidates if normalize_cik(row.get("cik") or row.get("cik_str")) == primary_cik), None)
+                    security_item = security_item or (candidates[0] if candidates else None)
             except Exception:
                 security_item = None
-        if isinstance(security_item, dict) and (security_item.get("cik") or security_item.get("cik_str")):
-            item = security_item
-        cik = normalize_cik(item.get("cik_str") or item.get("cik"))
-        name = str(item.get("title") or item.get("name") or symbol)
-        return IssuerIdentity(
+
+        primary_cik = normalize_cik(item.get("cik_str") or item.get("cik"))
+        exchange_cik = normalize_cik(security_item.get("cik") or security_item.get("cik_str")) if isinstance(security_item, dict) else None
+        cik = primary_cik
+        name = str(item.get("title") or item.get("name") or symbol).strip()
+        exchange = _normalize_exchange((security_item or {}).get("exchange") or item.get("exchange"))
+        security_title = str((security_item or {}).get("security_title") or (security_item or {}).get("securityTitle") or item.get("security_title") or item.get("securityTitle") or "").strip() or None
+        diagnostics: dict[str, Any] = {
+            "IDENTITY_RESOLUTION_SOURCE": "SEC_TICKER_CIK",
+            "TICKER_CIK_MATCH": "YES" if primary_cik else "NO",
+            "EXCHANGE_MATCH": "YES" if exchange_cik and exchange_cik == primary_cik else ("UNAVAILABLE" if not security_item else "NO"),
+            "REGISTRANT_NAME_MATCH": "UNVALIDATED",
+            "CIK_VALID": "YES" if primary_cik else "NO",
+        }
+        if exchange_cik and primary_cik and exchange_cik != primary_cik:
+            diagnostics["TICKER_CIK_MATCH"] = "NO"
+            diagnostics["EXCHANGE_CIK"] = exchange_cik
+        identity = IssuerIdentity(
             symbol, name, cik, SEC_TICKERS_EXCHANGE if security_item else SEC_TICKERS,
-            exchange=str(item.get("exchange") or "") or None,
-            security_title=str(item.get("security_title") or item.get("securityTitle") or "") or None,
+            exchange=exchange,
+            security_title=security_title,
             sec_registrant_cik=cik,
             sec_registrant_name=name,
-            identity_confidence="HIGH" if security_item else "MEDIUM",
+            identity_confidence="HIGH" if security_item and exchange_cik == primary_cik else "MEDIUM",
+            identity_diagnostics=diagnostics,
         )
+        self._validate_identity_from_submissions(identity, force=force)
+        return identity
+
+    @staticmethod
+    def _filing_regime(forms: set[str]) -> str | None:
+        domestic = {"10-K", "10-K/A", "10-Q", "10-Q/A", "8-K", "8-K/A"}
+        foreign = {"20-F", "20-F/A", "40-F", "6-K", "6-K/A"}
+        if forms & domestic:
+            return "DOMESTIC_SEC_REPORTING_REGIME"
+        if forms & foreign:
+            return "FOREIGN_PRIVATE_ISSUER"
+        return None
+
+    def _validate_identity_from_submissions(self, identity: IssuerIdentity, *, force: bool = False) -> None:
+        """Cross-check ticker/name/exchange and infer forms without name lookup.
+
+        SEC's ticker registry remains authoritative for resolution.  The
+        submissions endpoint is a second, point-in-time consistency check.  A
+        temporarily unavailable endpoint is recorded as unavailable rather
+        than replacing a valid ticker/CIK mapping with a guess.
+        """
+        try:
+            payload = self._submissions(identity, force=force)
+        except Exception as exc:
+            identity.identity_diagnostics["FILING_METADATA_CONSISTENT"] = "UNAVAILABLE"
+            identity.identity_diagnostics["FILING_METADATA_ERROR"] = type(exc).__name__
+            identity.identity_diagnostics.setdefault("FILING_REGIME", "UNAVAILABLE")
+            return
+        payload_name = str(payload.get("name") or "").strip()
+        tickers = {str(value).upper() for value in (payload.get("tickers") or [])}
+        exchanges = {str(value).upper() for value in (payload.get("exchanges") or [])}
+        identity.identity_diagnostics["TICKER_CIK_MATCH"] = "YES" if identity.ticker.upper() in tickers else "NO"
+        identity.identity_diagnostics["REGISTRANT_NAME_MATCH"] = "YES" if payload_name and payload_name.casefold() == identity.company_name.casefold() else ("NO" if payload_name else "UNAVAILABLE")
+        identity.identity_diagnostics["EXCHANGE_MATCH"] = "YES" if not identity.exchange or not exchanges or identity.exchange.upper() in exchanges else "NO"
+        forms = set()
+        recent = (payload.get("filings") or {}).get("recent") or {}
+        forms.update(str(form).upper() for form in (recent.get("form") or []) if form)
+        identity.filing_regime = self._filing_regime(forms)
+        jurisdiction = str(payload.get("stateOfIncorporationDescription") or payload.get("stateOfIncorporation") or "").strip()
+        identity.jurisdiction = SEC_JURISDICTION_CODES.get(jurisdiction.upper(), jurisdiction) or None
+        identity.verified_at = date.today().isoformat()
+        identity.identity_diagnostics["FILING_METADATA_CONSISTENT"] = "YES" if identity.identity_diagnostics.get("TICKER_CIK_MATCH") == "YES" and identity.identity_diagnostics.get("REGISTRANT_NAME_MATCH") in {"YES", "UNAVAILABLE"} else "NO"
+        identity.identity_diagnostics["FILING_REGIME"] = identity.filing_regime or "UNKNOWN"
 
     @staticmethod
     def _date_allowed(value: str | None, from_date: str | None, to_date: str | None) -> bool:
