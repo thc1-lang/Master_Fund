@@ -104,7 +104,7 @@ class TemporalChange:
     rules_version: str = "temporal-rules-v1"
     provider: str = "deterministic-temporal-v1"
     model_version: str | None = None
-    temporal_version: str = "temporal-comparison-v2"
+    temporal_version: str = "temporal-comparison-v3"
     comparison_horizon: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
@@ -124,7 +124,7 @@ class TemporalChange:
         data.setdefault("rules_version", "temporal-rules-v1")
         data.setdefault("provider", "deterministic-temporal-v1")
         data.setdefault("model_version", None)
-        data.setdefault("temporal_version", "temporal-comparison-v2")
+        data.setdefault("temporal_version", "temporal-comparison-v3")
         data.setdefault("comparison_horizon", "unknown")
         return cls(**data)
 
@@ -159,3 +159,9 @@ class TemporalComparisonResult:
     counts_by_type: dict[str, int] = field(default_factory=dict)
     period_integrity_failures: list[str] = field(default_factory=list)
     state_period: str | None = None
+    # PIT period eligibility is intentionally metadata-only: excluded
+    # forward/future claims remain available to guidance and catalyst users.
+    as_of_date: str | None = None
+    eligible_periods: list[str] = field(default_factory=list)
+    excluded_periods: list[dict[str, str]] = field(default_factory=list)
+    period_diagnostics: dict[str, Any] = field(default_factory=dict)

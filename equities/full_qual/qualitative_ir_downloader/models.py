@@ -68,6 +68,27 @@ class Document:
     issuer_verified: bool = False
     retrieved_at: str | None = None
     provenance: list[dict[str, str]] = field(default_factory=list)
+    # Source identity is kept on every acquired document so downstream
+    # normalization can reject affiliate/holding-company material without
+    # changing any analytical parser.
+    canonical_registrant_cik: str | None = None
+    canonical_registrant_name: str | None = None
+    source_registrant_cik: str | None = None
+    source_registrant_name: str | None = None
+    source_lineage_relation: str = "UNKNOWN"
+    source_identity_eligible: bool = True
+    # A discovered URL may be an HTML viewer/download wrapper rather than the
+    # actual document. Preserve both URLs and the deterministic resolution
+    # evidence for provenance and cache deduplication.
+    original_source_url: str | None = None
+    wrapper_detected: bool = False
+    wrapper_type: str | None = None
+    wrapper_resolution_method: str | None = None
+    resolved_document_url: str | None = None
+    resolved_content_type: str | None = None
+    resolved_http_status: int | None = None
+    resolution_confidence: str | None = None
+    document_type_hint: str | None = None
 
 @dataclass
 class Issue:

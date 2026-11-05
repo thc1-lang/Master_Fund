@@ -116,8 +116,8 @@ class NormalizedDocument:
     source_status: str = "VERIFIED"
     extraction_status: str = "VERIFIED"
     document_hash: str | None = None
-    normalization_version: str = "qualitative-normalization-v2"
-    schema_version: str = "normalized-document-schema-v2"
+    normalization_version: str = "qualitative-normalization-v3"
+    schema_version: str = "normalized-document-schema-v3"
 
     def validate(self) -> list[str]:
         from .extraction_safety import validate_extracted_text

@@ -113,6 +113,8 @@ class InstitutionalDossier:
     # Exact analytical generations used to build this dossier.  A dossier is
     # only reusable when these fingerprints match its current dependencies.
     analytical_provenance: dict[str, Any] = field(default_factory=dict)
+    issuer_cik: str | None = None
+    issuer_identity: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)

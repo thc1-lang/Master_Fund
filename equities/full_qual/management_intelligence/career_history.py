@@ -45,7 +45,15 @@ def _looks_like_name(value: str) -> bool:
     lowered = {token.lower() for token in tokens}
     if lowered & _HEADER_WORDS:
         return False
-    return bool(re.search(r"[A-Z][a-z]+", value))
+    # SEC proxy tables commonly render the roster in all capitals (for
+    # example ``CHRISTOPHE BECK``).  Preserve the conservative token and
+    # heading checks above, but accept that presentation as a human-name
+    # shape as well as ordinary title case.
+    return bool(re.search(r"[A-Z][a-z]+", value)) or (
+        len(tokens) >= 2
+        and all(token.isupper() for token in tokens)
+        and not any(token.lower() in _HEADER_WORDS for token in tokens)
+    )
 
 
 def _date_from_text(text: str, *, marker: str = "since") -> str | None:
@@ -259,6 +267,7 @@ class ManagementParseResult:
     role_changes: list[RoleChangeEvent] = field(default_factory=list)
     source: OfficialSource | None = None
     warnings: list[str] = field(default_factory=list)
+    diagnostics: dict[str, object] = field(default_factory=dict)
     status: str = "AVAILABLE"
 
 
@@ -359,7 +368,7 @@ def _plain_text_proxy_roster(
                         elif re.search(r"chair(?:man|person)?", occupation, re.I) and re.search(r"microsoft|company|board", occupation, re.I):
                             role_title = "Chairman and Director" if independent.lower() == "yes" else "Chairman and Chief Executive Officer"
                         evidence = f"{name} | {occupation} | {match.group('age')} | {match.group('since')} | {independent} | {match.group('boards')}"
-                        add(name, role_title, board=True, evidence=evidence)
+                        add(name, role_title, board=True, evidence=evidence, board_status="CURRENT")
                     return
         if not header:
             return
@@ -516,7 +525,109 @@ def _plain_text_proxy_roster(
                 role = "Director"
             independent = "independent" if role.lower().startswith(("independent", "lead independent")) else "not independently classified"
             evidence = f"Flattened proxy director row: {name}; {row_text}; {marker}; {independent}"
-            add(name, role, board=True, evidence=evidence)
+            add(name, role, board=True, evidence=evidence, board_status="CURRENT")
+
+    def _flat_sec_roster() -> None:
+        """Parse the SEC PDF stream ``name / occupation / age / since``.
+
+        PDF extraction often places ``Director`` and ``Since`` on separate
+        header lines and emits committee markers as standalone cells.  The
+        numeric age/year cells still provide a strong row boundary; only a
+        validated person-shaped line immediately preceding each boundary is
+        promoted.
+        """
+        header = re.search(
+            r"^\s*Name\s+and\s+Primary\s*$|^\s*Name\s+and\s+Primary\s+Occupation\s*$",
+            text, re.I | re.M,
+        )
+        if not header:
+            return
+        lines = [_clean(line) for line in text[header.end():].splitlines() if _clean(line)]
+        tail_pattern = re.compile(r"^(?P<age>\d{2})\s+(?P<since>(?:19|20)\d{2})\s+(?P<boards>-|\d+\*?)(?:\s+(?P<boards2>-|\d+\*?))?", re.I)
+        tails = [(index, match) for index, line in enumerate(lines) if (match := tail_pattern.fullmatch(line))]
+        if not tails:
+            return
+        blocked = re.compile(r"\b(?:ceo|cfo|chief|executive|officer|president|chairman|chair|former|founder|captain|director|company|corporation|inc|public|boards?|committee|audit|finance|security|governance|compensation|occupation|name|age|since|and|of|the|air|lines)\b|[&,;�]", re.I)
+        previous = 0
+        for tail_index, tail in tails:
+            segment = lines[previous:tail_index]
+            previous = tail_index + 1
+            candidates: list[tuple[int, str]] = []
+            for line_index, line in enumerate(segment):
+                value = line.strip(" *:")
+                if not _looks_like_name(value) or blocked.search(value):
+                    continue
+                tokens = re.findall(r"[A-Za-z][A-Za-z'’-]*", value)
+                uppercase = sum(token.isupper() for token in tokens)
+                candidates.append((uppercase * 10 - line_index, value))
+            if not candidates:
+                continue
+            name = max(candidates, key=lambda item: item[0])[1]
+            name_index = next((idx for idx, line in enumerate(segment) if line == name), len(segment) - 1)
+            occupation = _clean(" ".join(segment[name_index + 1:]))
+            role = "Director"
+            if re.search(r"(?:non[- ]executive\s+)?chair(?:man|person)?\s+of\s+the\s+board", occupation, re.I):
+                role = "Chair and Director"
+            elif re.search(r"\blead\s+independent\b", occupation, re.I):
+                role = "Lead Independent Director"
+            evidence = f"Flattened SEC proxy roster: {name} | {occupation} | {tail.group('age')} | {tail.group('since')} | {tail.group('boards')}"
+            add(name, role, board=True, evidence=evidence, board_status="CURRENT")
+
+    def _flat_split_name_table() -> None:
+        """Parse a flattened SEC nominee table with wrapped name cells.
+
+        SEC PDF extraction may emit a row as ``surname / age / since`` while
+        splitting a given name across preceding lines.  The numeric age/year
+        pair is the row boundary; only the nearest person-shaped cells are
+        considered, and the surrounding proxy statement must explicitly say
+        whether nominees are incumbent directors.
+        """
+        section_match = re.search(
+            r"(?:Election\s+of\s+Directors\s*\(Proposal\s+1\)|The\s+following\s+table\s+provides\s+summary\s+information\s+about\s+each\s+director\s+nominee)"
+            r"(?P<section>.*?)(?:Director\s+Qualifications\s+and\s+Nomination|Recent\s+Refreshment|Board\s+Experience\s+and\s+Composition)",
+            text, re.I | re.S,
+        )
+        if not section_match:
+            return
+        section = section_match.group("section")
+        lines = [_clean(line) for line in section.splitlines() if _clean(line)]
+        row_pattern = re.compile(r"^(?P<age>\d{2})\s+(?P<since>(?:19|20)\d{2})(?P<tail>.*)$")
+        rows = [(index, match) for index, line in enumerate(lines) if (match := row_pattern.match(line))]
+        if not rows:
+            return
+        current_nominees = bool(re.search(r"each\s+nominee\s+is\s+currently\s+a\s+director", text, re.I))
+        issuer_tokens = [token for token in normalize_name(company_name).split() if len(token) > 3]
+        blocked = re.compile(
+            r"\b(?:director|directors|independent|nominee|nominees|occupation|retired|chairman|chairperson|chair|chief|executive|officer|president|partner|company|corporation|inc|public|boards?|committee|since|age|lead|management|membership|former|financial|expert|number|other|table|contents|the|and|for|of|our|with|from)\b|[&,;�]",
+            re.I,
+        )
+        previous = 0
+        for row_index, match in rows:
+            segment = lines[previous:row_index]
+            previous = row_index + 1
+            candidates: list[tuple[int, int, str]] = []
+            for width in range(1, min(4, len(segment)) + 1):
+                for begin in range(max(0, len(segment) - 6), len(segment) - width + 1):
+                    value = _clean(" ".join(segment[begin:begin + width])).replace("- ", "-")
+                    value = re.sub(r"^(?:boards?|chairperson)\s+", "", value, flags=re.I)
+                    value = re.sub(r"^\d+\s+", "", value)
+                    value = re.sub(r"\s*\([^)]*\)", "", value).strip()
+                    if _looks_like_name(value) and not blocked.search(value):
+                        candidates.append((width, begin, value))
+            if not candidates:
+                continue
+            width, begin, name = max(candidates, key=lambda item: (item[0], item[1]))
+            tail = _clean(" ".join(segment[begin:] + [match.group("tail")]))
+            role = "Independent Director" if re.search(r"\b(?:ü|independent)\b", tail, re.I) else "Director"
+            if re.search(r"lead\s+director", tail, re.I):
+                role = "Lead Independent Director"
+            elif re.search(r"chairperson|chairman", tail, re.I):
+                role = "Chair and Director" if role.startswith("Independent") else "Chair and Director"
+            issuer_context = any(re.search(r"\b" + re.escape(token) + r"\b", tail, re.I) for token in issuer_tokens)
+            if issuer_context and re.search(r"\b(?:president|ceo|chief\s+executive)\b", tail, re.I):
+                role = "Director"
+            evidence = f"Flattened split-name proxy row: {name} | {tail} | age {match.group('age')} | director since {match.group('since')}"
+            add(name, role, board=True, is_current=current_nominees or not bool(re.search(r"nominee", section, re.I)), evidence=evidence, board_status="CURRENT" if current_nominees else "NOMINEE")
 
     nominees = re.search(
         r"nominees?\s+as\s+directors?:\s*(?P<names>.+?)(?:\.\s*(?:FOR|Your\s+board)\b)",
@@ -653,7 +764,7 @@ def _plain_text_proxy_roster(
             elif role == "Director" and re.search(r"non[- ]executive\s+chair", role_text, re.I):
                 role = "Non-Executive Chairman and Director"
             evidence = f"{candidate} | {role_text} | {marker}"
-            add(candidate, role, board=True, evidence=evidence)
+            add(candidate, role, board=True, is_current=False, evidence=evidence, board_status="NOMINEE")
             if since_match:
                 flat_board_dates[normalize_name(candidate)] = since_match.group(1)
 
@@ -688,7 +799,39 @@ def _plain_text_proxy_roster(
             current = surname not in former and not re.search(r"\bretired\b", role, re.I)
             add(name, role, board=False, is_current=current, evidence=f"Explicit NEO roster: {name} — {role}")
 
-    def add(name: str, role_title: str, *, board: bool, is_current: bool = True, evidence: str = "") -> None:
+    def _narrative_board_biographies() -> None:
+        """Recover explicit director biographies from flattened proxy text.
+
+        A subset of SEC/issuer proxies uses a heading followed by one name
+        per line and a short biography instead of a roster table.  The
+        heading plus nearby board-role language is the evidence boundary;
+        arbitrary names elsewhere in the filing are never promoted.
+        """
+        heading = re.search(
+            r"(?im)^[ \t]*(?:board\s+of\s+directors|director\s+nominees?|continuing\s+directors|nominees?\s+for\s+director)[ \t]*$",
+            text,
+        )
+        if not heading:
+            return
+        section = text[heading.end(): heading.end() + 18000]
+        lines = [_clean(line) for line in section.splitlines() if _clean(line)]
+        blocked = re.compile(r"\b(?:board|committee|governance|qualifications?|corporate|proposal|shareholder|election|director\s+nominees?)\b", re.I)
+        for index, line in enumerate(lines):
+            candidate = line.strip(" *:")
+            if not _looks_like_name(candidate) or blocked.search(candidate):
+                continue
+            nearby = _clean(" ".join(lines[index + 1:index + 5]))
+            if not re.search(r"\b(?:director|board\s+member|chair|nominee|served\s+on\s+the\s+board|joined\s+the\s+board)\b", nearby, re.I):
+                continue
+            role = "Independent Director" if re.search(r"\bindependent\b", nearby, re.I) else "Director"
+            if re.search(r"lead\s+independent", nearby, re.I):
+                role = "Lead Independent Director"
+            elif re.search(r"(?:non[- ]executive\s+)?chair", nearby, re.I):
+                role = "Chair and Director"
+            historical = bool(re.search(r"\b(?:former|retired|emeritus)\s+(?:director|board\s+member)\b", nearby, re.I))
+            add(candidate, role, board=True, is_current=not historical, evidence=f"Proxy director biography: {candidate} — {nearby[:1200]}")
+
+    def add(name: str, role_title: str, *, board: bool, is_current: bool = True, evidence: str = "", board_status: str = "CURRENT") -> None:
         name = re.sub(r"\s*\([a-z]\)", "", _clean(name), flags=re.I).strip(" ,")
         if not _looks_like_name(name):
             return
@@ -727,10 +870,21 @@ def _plain_text_proxy_roster(
                 start_date=start_date if is_current else None,
                 date_precision=_date_precision(start_date if is_current else None),
                 title_as_reported=role_title, responsibilities=responsibilities_from_title(role_title),
-                evidence_text=evidence or role_title, source_ids=[source.source_id],
+                evidence_text=evidence or role_title, source_ids=[source.source_id], election_status=board_status,
             ) for category in categories
         )
         if board:
+            # A proxy commonly presents the same incumbent in both the
+            # nominee list and the detailed board roster.  Preserve the
+            # stronger current-board assertion when a later broad nominee
+            # list repeats that person; otherwise the append/upsert order can
+            # silently downgrade every incumbent to NOMINEE.
+            existing_board = next(
+                (item for item in result.boards if item.person_id == person.person_id),
+                None,
+            )
+            if existing_board is not None and existing_board.is_current and not is_current:
+                return
             result.boards.append(BoardMembership(
                 board_id=f"board:{_stable(person.person_id, company_name, role_title)}",
                 person_id=person.person_id, ticker=filing.ticker.upper(), board_company=company_name,
@@ -739,20 +893,24 @@ def _plain_text_proxy_roster(
                 board_classification="PUBLIC_COMPANY_CONFIRMED", board_role=role_title,
                 start_date=start_date,
                 date_precision=_date_precision(start_date),
-                is_current=is_current, evidence_text=evidence or role_title, source_ids=[source.source_id],
+                is_current=is_current, evidence_text=evidence or role_title, source_ids=[source.source_id], board_status=board_status,
             ))
 
     _flat_nominees()
     _flat_director_since_roster()
+    _flat_sec_roster()
+    _flat_split_name_table()
     if not result.boards:
         _narrative_nominee_roster()
+    if not result.boards:
+        _narrative_board_biographies()
 
     if nominees:
         for raw_name in re.split(r",|\band\b", nominees.group("names"), flags=re.I):
             name = _clean(raw_name).strip(" .")
             if _looks_like_name(name):
                 role = board_role(name)
-                add(name, role, board=True, evidence=f"Proxy nominee roster: {name} — {role}")
+                add(name, role, board=True, is_current=False, evidence=f"Proxy nominee roster: {name} — {role}", board_status="NOMINEE")
 
     # Named executive officers are often rendered as a prose list in PDF
     # text rather than an HTML table.  The list is an explicit SEC roster;
@@ -911,6 +1069,326 @@ def _plain_text_proxy_roster(
             add(name, role or "Named Executive Officer", board=False, is_current=current, evidence=f"Explicit NEO roster: {name} — {role}")
 
 
+def parse_foreign_source(text: str | bytes, filing: SECFiling, company_name: str, *, as_of_date: str | None = None) -> ManagementParseResult:
+    """Parse jurisdiction-neutral annual/20-F/AGM evidence.
+
+    This parser intentionally relies on semantic section and role language,
+    not on a U.S. proxy table shape.  It accepts a flattened annual report,
+    an AGM result, or a relevant 6-K and preserves the exact source on every
+    emitted record.
+    """
+    raw = text.decode("utf-8", errors="replace") if isinstance(text, bytes) else str(text or "")
+    if "<" in raw and ">" in raw[:2000]:
+        raw = BeautifulSoup(raw, "html.parser").get_text("\n")
+    raw = raw.replace("\r", "\n").replace("\u00a0", " ").replace("�", " ")
+    raw = re.sub(r"[ \t]+", " ", raw)
+    source = OfficialSource(
+        source_id=f"sec:{filing.issuer_cik}:{filing.accession_number}",
+        source_authority="sec_official_filing", source_type=filing.form_type.upper(),
+        url=filing.source_url, local_path=filing.local_source_path,
+        issuer_cik=filing.issuer_cik, accession_number=filing.accession_number,
+        filing_date=filing.filing_date, report_date=filing.report_date,
+        public_availability_date=filing.available_date or filing.filing_date,
+    )
+    result = ManagementParseResult(source=source)
+    by_key: dict[str, ManagementPerson] = {}
+    cutoff = as_of_date or "9999-12-31"
+    board_rows: list[BoardMembership] = []
+
+    def add(name: str, role: str, *, board: bool = False, current: bool = True, evidence: str = "") -> None:
+        name = _clean(name).strip(" .,:;*\u2020")
+        if not _looks_like_name(name):
+            return
+        categories = classify_role(role)
+        if board and "director" not in categories and "chair" not in categories and "lead_independent_director" not in categories:
+            categories.append("director")
+        categories = sorted(set(categories or (["director"] if board else ["officer"])))
+        key = normalize_name(name)
+        person = by_key.get(key)
+        if person is None:
+            person = ManagementPerson(
+                person_id=person_key(filing.ticker, name), ticker=filing.ticker.upper(), company_name=company_name,
+                full_name=name, normalized_name=key, issuer_cik=filing.issuer_cik,
+                current_roles=[role] if current else [], role_categories=categories,
+                current_since=filing.filing_date if current else None,
+                relevant_responsibilities=responsibilities_from_title(role),
+                source_ids=[source.source_id], created_at=filing.filing_date or "", updated_at=filing.filing_date or "",
+            )
+            by_key[key] = person
+        else:
+            if current and role not in person.current_roles:
+                person.current_roles.append(role)
+            person.role_categories = sorted(set(person.role_categories + categories))
+            person.relevant_responsibilities = sorted(set(person.relevant_responsibilities + responsibilities_from_title(role)))
+            person.source_ids = sorted(set(person.source_ids + [source.source_id]))
+        person.source_urls = sorted(set(person.source_urls + [source.url]))
+        if source.local_path:
+            person.source_local_paths = sorted(set(person.source_local_paths + [source.local_path]))
+        if source.accession_number:
+            person.source_accession_numbers = sorted(set(person.source_accession_numbers + [source.accession_number]))
+        person.source_form_types = sorted(set(person.source_form_types + [source.source_type]))
+        person.source_url = source.url; person.local_source_path = source.local_path
+        person.accession_number = source.accession_number; person.form_type = source.source_type
+        result.roles.extend(RoleAssertion(
+            assertion_id=f"role:{_stable(person.person_id, role, str(current), source.accession_number or '')}",
+            person_id=person.person_id, ticker=filing.ticker.upper(), issuer_cik=filing.issuer_cik,
+            role=role, role_category=category, is_current=current,
+            start_date=filing.filing_date if current else None,
+            date_precision=_date_precision(filing.filing_date if current else None),
+            title_as_reported=role, responsibilities=responsibilities_from_title(role),
+            evidence_text=evidence or role, source_ids=[source.source_id], source_url=source.url,
+            local_source_path=source.local_path, accession_number=source.accession_number,
+            form_type=source.source_type, public_availability_date=source.public_availability_date,
+        ) for category in categories)
+        if board:
+            board_rows.append(BoardMembership(
+                board_id=f"board:{_stable(person.person_id, company_name, role)}", person_id=person.person_id,
+                ticker=filing.ticker.upper(), board_company=company_name, issuer_cik=filing.issuer_cik,
+                person_company_id=f"relationship:{_stable(person.person_id, filing.issuer_cik)}",
+                board_ticker=filing.ticker.upper(), board_cik=filing.issuer_cik,
+                board_classification="PUBLIC_COMPANY_CONFIRMED", board_role=role,
+                is_current=current, evidence_text=evidence or role, source_ids=[source.source_id],
+                source_url=source.url, local_source_path=source.local_path,
+                accession_number=source.accession_number, form_type=source.source_type,
+                public_availability_date=source.public_availability_date,
+                board_status="CURRENT" if current else "NOMINEE",
+            ))
+
+    def section(pattern: str, end_patterns: tuple[str, ...]) -> str:
+        # Flattened annual reports repeat section names in the table of
+        # contents.  The last exact heading is the body section; selecting
+        # the first match would hand the parser an empty TOC fragment.
+        matches = list(re.finditer(pattern, raw, re.I | re.M))
+        for match in reversed(matches):
+            tail = raw[match.end():]
+            endings = [re.search(item, tail, re.I | re.M) for item in end_patterns]
+            ends = [item.start() for item in endings if item]
+            body = tail[:min(ends)] if ends else tail[:50000]
+            if body.strip():
+                return body
+        return ""
+
+    board_text = section(r"^\s*(?:Our Board|Board of Directors)\s*$", (r"^\s*(?:\d+\s+)?Our Executive Committee\s*$", r"^\s*(?:\d+\s+)?Culture and the Board\s*$", r"^\s*(?:\d+\s+)?Directors['’] Report\s*$"))
+    if not board_text:
+        board_text = section(r"Our Board\s+Our business is led by our Board of Directors", (r"Our Executive Committee", r"Culture and the Board", r"Directors['’] Report"))
+    role_words = re.compile(r"\b(?:chair|director|executive|non[- ]executive|independent|chief|CEO|CFO|president|secretary|officer)\b", re.I)
+    lines = [_clean(line) for line in board_text.splitlines() if _clean(line)]
+    blocked_name = re.compile(r"\b(?:company|strategy|success|experience|external|appointments?|committee|skills|career|board|chief|executive|director|member|served|group|financial|technology|management|leadership|read|full|biographies|tenure|public|independent|non[- ]executive|counsel|officer|network|please|note|year|ended|report|future|shareholders?|resolution|voting|rights|information|page|continued|controls?|procedures?|governance|culture|activities|focus|highlights|financials|business|model|results|and|of|the|for|to)\b|[�•–—]", re.I)
+
+    def valid_name(value: str) -> bool:
+        tokens = value.split()
+        # Reject table markers/organization fragments while retaining names
+        # with initials and common post-nominals (for example CBE).
+        if (
+            "/" in value
+            or len(tokens) < 2
+            or any(token.rstrip(".,:;()[]").upper() in {"UK", "US", "EU", "PLC", "LTD", "INC", "LLC", "AG", "NV", "SA"} for token in tokens)
+            or any(len(token.rstrip(".,:;()[]")) == 1 and not token.endswith(".") for token in tokens)
+            or not tokens[0][:1].isupper()
+        ):
+            return False
+        return len(value) <= 60 and not blocked_name.search(value) and _looks_like_name(value)
+
+    def clean_role(value: str, person_name: str | None = None) -> str:
+        value = _clean(value)
+        # Flattened annual-report rows often place the person's first name at
+        # the start of the biography immediately after the title (for
+        # example, ``... CEO ... Guillaume was appointed ...``).  Remove that
+        # biography boundary using the validated name rather than guessing
+        # from capitalisation; otherwise a title beginning with CEO/Chief is
+        # mistaken for a person name and gets truncated.
+        if person_name:
+            first_name = person_name.split()[0]
+            names = sorted({person_name, first_name}, key=len, reverse=True)
+            boundary = r"\s+(?:" + "|".join(re.escape(item) for item in names) + r")\s+(?:was|is|joined|has|served|appointed|currently)\b"
+            value = re.split(boundary, value, maxsplit=1, flags=re.I)[0]
+            name_prefix = " ".join(person_name.split()[:2])
+            if name_prefix and re.search(r"\s+" + re.escape(name_prefix) + r"$", value, re.I):
+                value = re.sub(r"\s+" + re.escape(name_prefix) + r"$", "", value, flags=re.I)
+        value = re.split(r"\s+(?=[A-Z][A-Za-zÀ-ÿ'’-]*(?:\s+[A-Z][A-Za-zÀ-ÿ'’-]*){0,3}(?:'s)?\s+(?:was|is|joined|has|served|appointed|currently)\b)", value, maxsplit=1)[0]
+        value = re.split(r"\s+(?=(?:Since joining|[A-Z][A-Za-zÀ-ÿ'’-]*,\s+an\s+Executive|[A-Z][A-Za-zÀ-ÿ'’-]*\s+brings)\b)", value, maxsplit=1)[0]
+        return value.strip(" .;:")
+
+    for index, line in enumerate(lines):
+        if not valid_name(line):
+            continue
+        nearby = []
+        for candidate in lines[index + 1:index + 7]:
+            if re.match(r"^(?:Career and experience|Skills and attributes|Tenure:|External appointments|Committee key|Read full biographies)", candidate, re.I):
+                break
+            if valid_name(candidate) and nearby:
+                break
+            nearby.append(candidate)
+            if re.search(r"[.!?]$", candidate) or len(candidate) > 120:
+                break
+            if len(" ".join(nearby)) > 240:
+                break
+        role = clean_role(" ".join(nearby), line)
+        if not role_words.search(role):
+            continue
+        current = not bool(re.search(r"prospective|subject to shareholder approval|will be appointed|will retire|retired|former", role, re.I))
+        add(line, role, board=True, current=current, evidence=f"Foreign issuer board roster: {line} — {role}")
+
+    executive_text = section(r"^\s*(?:\d+\s+)?Our Executive Committee\s*\n\s*Biographical details", (r"^\s*(?:\d+\s+)?Culture and the Board\s*$", r"^\s*(?:\d+\s+)?Executive Committee changes\s*$", r"^\s*Strategic report"))
+    if executive_text:
+        lines = [_clean(line) for line in executive_text.splitlines() if _clean(line)]
+        for index, line in enumerate(lines):
+            if not valid_name(line):
+                continue
+            nearby = []
+            for candidate in lines[index + 1:index + 5]:
+                if valid_name(candidate) and nearby:
+                    break
+                if re.match(r"^(?:Read more|Career and experience|Committee key)", candidate, re.I):
+                    break
+                nearby.append(candidate)
+                if re.search(r"[.!?]$", candidate) or len(candidate) > 120:
+                    break
+            role = clean_role(" ".join(nearby), line)
+            if role_words.search(role) and re.search(r"chief|CEO|CFO|executive|president|counsel|officer|CTO|CNO", role, re.I):
+                add(line, role, board=False, current=True, evidence=f"Foreign issuer executive committee: {line} — {role}")
+
+    form = filing.form_type.upper()
+    if form == "6-K" and re.search(r"result(?:s)? of (?:the )?AGM|annual general meeting", raw, re.I):
+        # AGM resolutions establish the seated board as of the meeting date.
+        # SEC/issuer flattened text frequently inserts line breaks between a
+        # nominee's name and ``as a Director``.  Normalise whitespace only for
+        # this bounded resolution parse; retain the original evidence excerpt.
+        agm_flat = re.sub(r"\s+", " ", raw)
+        # Layout-preserving PDF extraction can interleave poll columns between
+        # a nominee's first and last name (``Olaf 12,014,268,113 ... Koch as
+        # a Director``).  Strip only numeric vote/percentage cells inside an
+        # explicit election resolution; ordinary names and prose remain
+        # untouched.
+        def _remove_poll_cells(match: re.Match[str]) -> str:
+            body = re.sub(r"(?<![A-Za-z])(?:\d[\d,.]*(?:\.\d+)?%?|[-])(?=\s|$)", " ", match.group("body"))
+            return f"{match.group('prefix')}{body}"
+
+        agm_flat = re.sub(
+            r"(?P<prefix>\bTo\s+(?:re-)?elect\s+)(?P<body>.*?)(?=\s+as\s+(?:a\s+)?Director\b)",
+            _remove_poll_cells,
+            agm_flat,
+            flags=re.I,
+        )
+        for match in re.finditer(r"\bTo\s+(?:re-)?elect\s+(?P<name>[^0-9]{2,100}?)\s+as\s+(?:a\s+)?Director\b", agm_flat, re.I):
+            next_resolution = re.search(r"\b(?:To\s+(?:re-)?elect|Resolution\s+\d+|\d+\.\s+To\s+(?:re-)?elect)", agm_flat[match.end():], re.I)
+            resolution_tail = agm_flat[match.start():match.end() + (next_resolution.start() if next_resolution else 240)]
+            # A withdrawn resolution is not an election.  Keep the source
+            # evidence and departure event below, but do not add the person to
+            # the seated board.
+            if re.search(r"withdrawn|resignation|resigned|did not stand|retired", resolution_tail, re.I):
+                continue
+            candidate = _clean(match.group("name")).strip(" .,:;*-\u2020")
+            candidate = re.sub(r"(?:['’\u00e7])s$", "", candidate)
+            if valid_name(candidate):
+                add(candidate, "Director", board=True, current=True, evidence=match.group(0))
+        # AGM results may describe a retirement, a withdrawn re-election
+        # resolution, or a resignation rather than using a uniform verb.
+        departure_patterns = (
+            r"(?<![A-Za-z])(?!(?:Board|Resolution)\b)(?P<name>[A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+[A-Z][A-Za-zÀ-ÿ.'’\-]+){1,5})(?:'s)?\s+did not stand for re-election",
+            r"(?:re-election|re-elect)\s+(?P<name>[A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+[A-Z][A-Za-zÀ-ÿ.'’\-]+){1,5})\s+as\s+(?:a\s+)?Director\)?\s+was withdrawn[^.]{0,220}(?:resignation|resigned|retired)",
+            r"(?<![A-Za-z])(?!(?:Board|Resolution)\b)(?P<name>[A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+[A-Z][A-Za-zÀ-ÿ.'’\-]+){1,5})\s+(?:resigned|retired) from the Board",
+        )
+        for departure_pattern in departure_patterns:
+            for match in re.finditer(departure_pattern, agm_flat):
+                candidate = _clean(match.group("name")).strip(" .,:;*-\u2020")
+                candidate = re.sub(r"(?:['’\u00e7])s$", "", candidate)
+                if not valid_name(candidate):
+                    continue
+                key = normalize_name(candidate)
+                person = by_key.get(key)
+                if person:
+                    person.current_roles = [role for role in person.current_roles if "director" not in role.lower() and "chair" not in role.lower()]
+                    for row in board_rows:
+                        if row.person_id == person.person_id:
+                            row.is_current = False; row.board_status = "HISTORICAL"
+                    for assertion in result.roles:
+                        if assertion.person_id == person.person_id and assertion.role_category in {"director", "chair"}:
+                            assertion.is_current = False
+                result.role_changes.append(RoleChangeEvent(
+                    event_id=f"role-change:{_stable(filing.accession_number or '', match.group('name'), 'agm-departure')}", person_id=person.person_id if person else None,
+                    ticker=filing.ticker.upper(), issuer_cik=filing.issuer_cik, event_type="departure",
+                    person_name=candidate, effective_date=filing.filing_date,
+                    source_id=source.source_id, source_url=source.url, local_source_path=source.local_path,
+                    accession_number=source.accession_number, form_type=source.source_type, filing_date=filing.filing_date,
+                    evidence_text=match.group(0)[:1200],
+                ))
+
+    # Generic role-change language in a relevant 6-K is retained for PIT
+    # resolution; dates are only accepted when explicitly stated.
+    if form == "6-K":
+        # Foreign issuers commonly announce officer changes in a 6-K without
+        # an Item 5.02 heading.  Preserve the appointment and its effective
+        # date, while keeping a future-effective appointment out of the
+        # current roster at the requested PIT cutoff.
+        for match in re.finditer(
+            r"\b(?P<name>[A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+[A-Z][A-Za-zÀ-ÿ.'’\-]+){1,4})\s+(?:was\s+)?appointed\s+(?:as\s+)?(?P<role>[^.;\n]{3,120}?)\s+(?:effective|on)\s+(?P<date>\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+            raw,
+        ):
+            candidate = _clean(match.group("name")).strip(" .,:;*-\u2020")
+            role = clean_role(match.group("role"))
+            effective = _normalise_date(match.group("date"))
+            if not valid_name(candidate) or not role:
+                continue
+            is_current = not effective or effective <= cutoff
+            add(candidate, role, board=False, current=is_current, evidence=match.group(0)[:1200])
+            result.role_changes.append(RoleChangeEvent(
+                event_id=f"role-change:{_stable(filing.accession_number or '', candidate, 'appointment', effective or '')}", person_id=by_key.get(normalize_name(candidate)).person_id if by_key.get(normalize_name(candidate)) else None,
+                ticker=filing.ticker.upper(), issuer_cik=filing.issuer_cik, event_type="appointment",
+                person_name=candidate, role=role, effective_date=effective,
+                source_id=source.source_id, source_url=source.url, local_source_path=source.local_path,
+                accession_number=source.accession_number, form_type=source.source_type, filing_date=filing.filing_date,
+                evidence_text=match.group(0)[:1200],
+            ))
+        for match in re.finditer(r"(?P<name>[A-Z][A-Za-zÀ-ÿ.'’ -]+?)\s+(?:has\s+)?(?:stepped down|resigned|retired).*?(?:effective|on)\s+(?P<date>\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]+\s+\d{4})", raw, re.I | re.S):
+            result.role_changes.append(RoleChangeEvent(
+                event_id=f"role-change:{_stable(filing.accession_number or '', match.group('name'), match.group('date'))}", person_id=None,
+                ticker=filing.ticker.upper(), issuer_cik=filing.issuer_cik, event_type="departure",
+                person_name=_clean(match.group("name")), effective_date=_normalise_date(match.group("date")),
+                source_id=source.source_id, source_url=source.url, local_source_path=source.local_path,
+                accession_number=source.accession_number, form_type=source.source_type, filing_date=filing.filing_date,
+                evidence_text=match.group(0)[:1200],
+            ))
+    result.people = list(by_key.values())
+    result.boards = board_rows
+    result.relationships = [PersonCompanyRelationship(
+        person_company_id=f"relationship:{_stable(person.person_id, filing.issuer_cik)}", person_id=person.person_id,
+        issuer_cik=filing.issuer_cik, ticker=filing.ticker.upper(), company_name=company_name,
+        current_roles=list(person.current_roles), role_categories=list(person.role_categories),
+        status="current" if person.current_roles else "historical", source_ids=[source.source_id],
+        source_url=source.url, local_source_path=source.local_path, accession_number=source.accession_number,
+        form_type=source.source_type, evidence_text=person.biography or "Foreign issuer source roster evidence.",
+    ) for person in result.people]
+    result.diagnostics = {
+        "MANAGEMENT_PRIMARY_SOURCES": 1 if source else 0,
+        "MANAGEMENT_PEOPLE_CANDIDATES": len(result.people),
+        "MANAGEMENT_PEOPLE_VALIDATED": len(result.people),
+        "MANAGEMENT_PEOPLE_REJECTED": 0,
+        "MANAGEMENT_ROLE_CANDIDATES": len(result.roles),
+        "MANAGEMENT_CURRENT_ROLES": sum(bool(item.current_roles) for item in result.people),
+        "MANAGEMENT_SOURCE_COVERAGE": "AVAILABLE" if source else "NO_ELIGIBLE_SOURCE",
+    }
+    if not result.people:
+        result.status = "SOURCE_AVAILABLE_PARSER_FAILURE"
+        result.warnings.append("SOURCE_AVAILABLE_PARSER_FAILURE")
+    return result
+
+
+def _normalise_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return value
+    match = re.fullmatch(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", value)
+    if match:
+        try:
+            return datetime.strptime(f"{match.group(1)} {match.group(2)} {match.group(3)}", "%d %B %Y").date().isoformat()
+        except ValueError:
+            return value
+    return value
+
+
 def parse_proxy_people(html: str | bytes, filing: SECFiling, company_name: str) -> ManagementParseResult:
     """Parse structured proxy role tables and retain biography evidence.
 
@@ -947,6 +1425,17 @@ def parse_proxy_people(html: str | bytes, filing: SECFiling, company_name: str) 
             and re.search(r"\bposition\b|director since", header_text)
             or bool(re.search(r"\|\s*directors?\s*$", header_text))
             or bool(re.search(r"\bname\b.*\bdirector\s+since\b", header_text))
+            # SEC proxy tables frequently split the two parts of
+            # ``Director Since`` into separate cells (for example
+            # ``Name and Primary Occupation | Age | Director | Since``).
+            # Treat that stable column pair as a board roster even when the
+            # table has no literal ``Nominees`` heading.  The row-level
+            # person validation below still rejects headers and prose.
+            or bool(
+                re.search(r"\bname\b", header_text)
+                and re.search(r"\bdirector\b", header_text)
+                and re.search(r"\bsince\b", header_text)
+            )
         )
         executive_context = bool(
             re.search(r"(?:^|\|\s*)name\b", header_text)
@@ -956,10 +1445,27 @@ def parse_proxy_people(html: str | bytes, filing: SECFiling, company_name: str) 
         if not board_context and not executive_context:
             continue
         for row in table.find_all("tr"):
-            cells = [_clean(cell.get_text(" ", strip=True)) for cell in row.find_all(["td", "th"])]
+            cell_nodes = row.find_all(["td", "th"])
+            cells = [_clean(cell.get_text(" ", strip=True)) for cell in cell_nodes]
             cells = [cell for cell in cells if cell]
             if len(cells) < 2:
                 continue
+            # A common SEC HTML layout places the display name in a bold
+            # child followed by the occupation in the same cell, with spacer
+            # cells between every visible column.  Preserve that row
+            # structure instead of treating ``NAME occupation`` as one
+            # identity.  This is table-aware and applies to any issuer.
+            nonempty_nodes = [node for node in cell_nodes if _clean(node.get_text(" ", strip=True))]
+            if board_context and nonempty_nodes:
+                first_node = nonempty_nodes[0]
+                bold = first_node.find(["b", "strong"])
+                bold_name = _clean(bold.get_text(" ", strip=True)) if bold else ""
+                if bold_name and _looks_like_name(bold_name):
+                    full_first = _clean(first_node.get_text(" ", strip=True))
+                    occupation = _clean(full_first[len(bold_name):]) if full_first.lower().startswith(bold_name.lower()) else ""
+                    cells[0] = bold_name
+                    if occupation:
+                        cells.insert(1, occupation)
             name = re.sub(r"\s*\([^)]*\)", "", cells[0]).strip(" ,")
             if not _looks_like_name(name):
                 continue
@@ -969,8 +1475,18 @@ def parse_proxy_people(html: str | bytes, filing: SECFiling, company_name: str) 
                 categories.append("director")
             if not categories or (not executive_context and not board_context):
                 continue
-            # Rows labelled former/director emeritus are historical assertions.
-            is_current = not bool(re.search(r"\bformer\b|\bem(eritus|erita)\b|\bretired\b", row_text, re.I))
+            # In a board roster, ``Former CEO`` or ``Retired executive`` is
+            # usually the nominee's occupation, not a statement that the
+            # person left the issuer's board.  Only an explicit former/
+            # retired/emeritus *director* relationship makes the board row
+            # historical.
+            is_current = not bool(
+                re.search(
+                    r"\b(?:former|retired|emeritus|emerita)\s+(?:director|board\s+member|nominee)\b",
+                    row_text,
+                    re.I,
+                )
+            )
             role_cells = [cell for cell in cells[1:] if classify_role(cell)]
             role_title = role_cells[0] if role_cells else ("director" if board_context else (cells[1] if len(cells) > 1 else row_text))
             if re.fullmatch(r"\d+(?:\.\d+)?", role_title.strip()):
@@ -1061,7 +1577,7 @@ def parse_proxy_people(html: str | bytes, filing: SECFiling, company_name: str) 
     # (for example ``Chief Financial Officer`` or ``Walmart U``).  Keep only
     # person-shaped identities; their role assertions are discarded with the
     # invalid identity so they cannot pollute management or governance stores.
-    invalid_identity = re.compile(r"\b(?:chief|executive|officer|president|vice|ceo|cfo|walmart|company|board|director|chairman|chair|named|neo)\b", re.I)
+    invalid_identity = re.compile(r"\b(?:chief|executive|officer|president|vice|ceo|cfo|walmart|company|board|director|chairman|chair|named|neo|our|financial|performance|revenue|expenses|results|compensation|analysis|table|total|net|income)\b|[�]", re.I)
     invalid_keys = {key for key, person in by_key.items() if invalid_identity.search(person.full_name) or "," in person.full_name}
     if invalid_keys:
         invalid_ids = {by_key[key].person_id for key in invalid_keys}
@@ -1180,4 +1696,4 @@ def parse_proxy_people(html: str | bytes, filing: SECFiling, company_name: str) 
     return result
 
 
-__all__ = ["ManagementParseResult", "parse_proxy_people"]
+__all__ = ["ManagementParseResult", "parse_proxy_people", "parse_foreign_source"]

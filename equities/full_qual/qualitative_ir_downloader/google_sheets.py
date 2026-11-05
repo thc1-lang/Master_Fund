@@ -70,3 +70,14 @@ def read_stocks(config: Config, worksheet: str | None = None, ticker: str | None
     atomic_json(cache,{'spreadsheet_id':config.spreadsheet_id,'stocks':cached})
     if ticker:return [s for s in stocks if s.ticker.casefold()==ticker.casefold()]
     return stocks
+
+
+# Publication is kept in a separate adapter so acquisition remains read-only,
+# while these re-exports make the Sheets capability discoverable from the
+# existing module without changing its source-reader contract.
+from .google_sheets_publisher import (  # noqa: E402,F401
+    GoogleSheetsPublisher,
+    GOOGLE_SHEET_REPORT_SCHEMA_VERSION,
+    PUBLISHER_VERSION,
+    DEFAULT_QUALITATIVE_SPREADSHEET_ID,
+)

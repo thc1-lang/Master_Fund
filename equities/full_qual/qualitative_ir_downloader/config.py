@@ -5,6 +5,9 @@ from .events_config import EventConfig
 
 DEFAULT_SERVICE_ACCOUNT_PATH = Path(r"C:\Code\service_account.json")
 SPREADSHEET_ID = "1QF67DQEDF5QB8-q1JCuzyYPXSPJugxCMQ8DbUhOo_1c"
+# The acquisition universe remains on its historical workbook.  Full Qual V2
+# publication uses this separate institutional report workbook by default.
+DEFAULT_QUALITATIVE_SPREADSHEET_ID = "1GKmx61XDkLYvui2tA1lsU1K76CO9fUm2LN_7Vaf8kgU"
 WORKSHEETS = ("Safe", "High Growth Potential", "Turnaround Story")
 HEADLESS = True
 REQUEST_DELAY_SECONDS = 1.0
@@ -18,6 +21,12 @@ ACQUISITION_NO_PROGRESS_TIMEOUT_SECONDS = 900.0
 ACQUISITION_DEADLINE_SECONDS = 7200.0
 MAX_REDIRECTS = 8
 MAX_OFFICIAL_ROUTES = 24
+ACQUISITION_IDENTITY_BUDGET_SECONDS = 60.0
+ACQUISITION_CRITICAL_FINANCIAL_BUDGET_SECONDS = 300.0
+ACQUISITION_GOVERNANCE_BUDGET_SECONDS = 180.0
+ACQUISITION_NEWS_BUDGET_SECONDS = 180.0
+ACQUISITION_DEEP_ARCHIVE_BUDGET_SECONDS = 60.0
+ARCHIVE_NO_NEW_DOCUMENT_THRESHOLD = 3
 
 @dataclass(frozen=True)
 class Config:
@@ -36,6 +45,12 @@ class Config:
     stage_timeout: float = 900.0
     max_redirects: int = MAX_REDIRECTS
     max_official_routes: int = MAX_OFFICIAL_ROUTES
+    identity_budget: float = ACQUISITION_IDENTITY_BUDGET_SECONDS
+    critical_financial_budget: float = ACQUISITION_CRITICAL_FINANCIAL_BUDGET_SECONDS
+    governance_budget: float = ACQUISITION_GOVERNANCE_BUDGET_SECONDS
+    news_budget: float = ACQUISITION_NEWS_BUDGET_SECONDS
+    deep_archive_budget: float = ACQUISITION_DEEP_ARCHIVE_BUDGET_SECONDS
+    archive_no_new_document_threshold: int = ARCHIVE_NO_NEW_DOCUMENT_THRESHOLD
     max_archive_pages: int = 250
     max_links_per_company: int = 10000
     max_interactions: int = 500
@@ -44,3 +59,4 @@ class Config:
     max_section_pages: int = 20
     revalidate_ir: bool = False
     user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+    as_of_date: str | None = None

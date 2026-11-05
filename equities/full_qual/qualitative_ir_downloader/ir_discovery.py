@@ -14,6 +14,9 @@ from .rss import discover_rss
 from .company_identity import identify,domain_candidates
 from .ir_evidence import rank_result,brand_domain,ownership,noise
 from .discovery_cache import DiscoveryCache
+from .corporate_domain import (DomainCandidate, IMPLEMENTATION_VERSION as DOMAIN_IMPLEMENTATION_VERSION,
+                                candidate_from_url, classify_verified, deterministic_domain_order,
+                                generated_candidates)
 
 log = logging.getLogger(__name__)
 DOMAIN = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
@@ -68,7 +71,16 @@ class IRDiscovery:
         self.search_evidence={};self.queries=[];self.search_seconds=0.;self.rejected=[];self.seen_result_domains=set()
         self.identity=None;self.ticker='';self.cache=DiscoveryCache(browser.config.download_root)
         self.started=time.perf_counter();self.corporate_candidates=[]
+        self.issuer_cik: str | None = None
+        self.domain_candidates: list[DomainCandidate] = []
+        self.domain_diagnostics: list[dict[str, str]] = []
         self.scan_budget=bool(getattr(getattr(browser,"current_company",None),"scan_only",False))
+
+    def _domain_event(self, code: str, candidate: DomainCandidate | None = None, message: str = "") -> None:
+        item = {"code": code, "message": message}
+        if candidate is not None:
+            item.update({"url": candidate.url, "domain": candidate.domain, "source_type": candidate.source_type, "source_reference": candidate.source_reference, "verification_status": candidate.verification_status})
+        self.domain_diagnostics.append(item)
 
     async def search(self, page, query: str) -> list[str]:
         cached=self.cache.query(query)
@@ -140,6 +152,14 @@ class IRDiscovery:
             if search_identity:
                 self.ecosystem.official_corporate_domain=d.top_domain_under_public_suffix
                 self.ecosystem.official_corporate_url='https://'+d.top_domain_under_public_suffix+'/'
+                domain_candidate = next((item for item in self.domain_candidates if item.domain == d.top_domain_under_public_suffix), None)
+                if domain_candidate is None:
+                    domain_candidate = candidate_from_url(url, source_type="search_discovery", source_reference=url, confidence="MEDIUM")
+                    if domain_candidate:
+                        self.domain_candidates.append(domain_candidate)
+                if domain_candidate:
+                    classify_verified(domain_candidate, identity_match=True)
+                    self._domain_event("CORPORATE_DOMAIN_VERIFIED", domain_candidate, "Search title/snippet independently identifies the issuer")
                 log.info('Corporate identity from exact brand domain plus company-identifying search title/snippet: %s',url)
                 return
 
@@ -206,7 +226,10 @@ class IRDiscovery:
             'candidate_domains':sorted({DOMAIN(c.url).top_domain_under_public_suffix for c in self.candidates}|self.seen_result_domains),
             'corporate_candidates':self.corporate_candidates,'ir_candidates':[{'url':c.url,'score':c.officiality_score,'official':c.official,'evidence':c.evidence} for c in self.candidates],
             'rejected_candidates':self.rejected,'best_rejected_candidate':max(self.rejected,key=lambda r:r.get('score',0),default=None),'discovery_seconds':time.perf_counter()-self.started,
-            'failure_classification':None if any(c.official for c in self.candidates) else 'IR_DISCOVERY_FAILED'}
+            'failure_classification':None if any(c.official for c in self.candidates) else 'IR_DISCOVERY_FAILED',
+            'domain_resolution_implementation': DOMAIN_IMPLEMENTATION_VERSION,
+            'corporate_domain_candidates': [candidate.record() for candidate in deterministic_domain_order(self.domain_candidates)],
+            'corporate_domain_diagnostics': list(self.domain_diagnostics)}
 
     def register(self, candidate: IRCandidate, source: str, relation: str) -> None:
         if not candidate.official:
@@ -224,7 +247,18 @@ class IRDiscovery:
             parsed = urlsplit(url)
             domain = DOMAIN(url)
             brand = domain.domain.lower().replace("-", "")
-            if rank_result(url,company,self.ticker,**{k:self.search_evidence.get(url,{}).get(k,'') for k in ('title','snippet')})<0:
+            generated_candidate = next((item for item in self.domain_candidates
+                                        if item.domain == domain.top_domain_under_public_suffix), None)
+            relevance = rank_result(url,company,self.ticker,**{k:self.search_evidence.get(url,{}).get(k,'') for k in ('title','snippet')})
+            # Deterministic generated guesses are deliberately probeable even
+            # without search-result support.  They remain UNVERIFIED_GUESS
+            # until page identity/navigation evidence promotes them; this also
+            # makes DNS/HTTP rejection auditable rather than silently dropping
+            # the weakest candidate before it can be diagnosed.
+            generated_guess = bool(generated_candidate and generated_candidate.source_type in {
+                "corporate_brand", "normalized_brand", "legal_name_guess"
+            })
+            if relevance < 0 and not generated_guess:
                 continue
             # Only corporate roots, not arbitrary hosted company subdomains.
             host = parsed.hostname or ""
@@ -239,6 +273,13 @@ class IRDiscovery:
             cached_transport=self.cache.blocked(url)
             if cached_transport and cached_transport.get('failure_type') not in {'TimeoutError','TRANSPORT_FAILED'}:continue
             self.corporate_candidates.append(url)
+            domain_candidate = next((item for item in self.domain_candidates if item.url == canonicalize_url(url) or item.domain == DOMAIN(url).top_domain_under_public_suffix), None)
+            if domain_candidate is None:
+                domain_candidate = candidate_from_url(url, source_type="corporate_discovery", source_reference=url, confidence="LOW")
+                if domain_candidate:
+                    self.domain_candidates.append(domain_candidate)
+            if domain_candidate:
+                self._domain_event("CORPORATE_DOMAIN_CANDIDATE_GENERATED", domain_candidate, "Corporate page probe scheduled")
             try:
                 html_page=None
                 if self.scan_budget:
@@ -258,8 +299,14 @@ class IRDiscovery:
                                 raise CollectionError('SITE_BLOCKED',f'Public access challenge: {url}')
                             html_page=(canonicalize_url(response.url),title,text,parsed)
                     except CollectionError:raise
-                    except Exception:
+                    except Exception as exc:
                         if cached_transport:self.cache.failure(url,'HTTP_TRANSPORT_FAILED')
+                        # DNS/name-resolution failures cannot be repaired by a
+                        # browser retry.  Surface them to the common failure
+                        # recorder so the candidate is rejected and discovery
+                        # proceeds to the next deterministic domain.
+                        if any(token in str(exc).casefold() for token in ("name or service not known", "name_not_resolved", "nodename", "getaddrinfo", "dns")):
+                            raise
                 if html_page:
                     actual,title,body,soup=html_page
                     from .structured import soup_links
@@ -273,7 +320,18 @@ class IRDiscovery:
                     corporate_links=await links(page)
                 support=' '.join(r.get('title','')+' '+r.get('snippet','') for u,r in self.search_evidence.items() if DOMAIN(u).top_domain_under_public_suffix==DOMAIN(actual).top_domain_under_public_suffix)
                 if not corporate_identity(actual, title, body, company, support, self.ticker):
+                    if domain_candidate:
+                        domain_candidate.resolution_status = "RESOLVED"
+                        domain_candidate.http_status = 200
+                        domain_candidate.verification_status = "REJECTED"
+                        self._domain_event("CORPORATE_DOMAIN_IDENTITY_MISMATCH", domain_candidate, "Reachable page did not establish issuer identity")
                     continue
+                if domain_candidate:
+                    domain_candidate.resolution_status = "VERIFIED"
+                    domain_candidate.http_status = 200
+                    domain_candidate.redirect_target = actual if canonicalize_url(url) != actual else None
+                    classify_verified(domain_candidate, identity_match=True, ir_link_found=bool(corporate_links), redirect_target=domain_candidate.redirect_target)
+                    self._domain_event("CORPORATE_DOMAIN_VERIFIED", domain_candidate, "Corporate page identity and navigation verified")
                 self.ecosystem.official_corporate_url = actual
                 self.ecosystem.official_corporate_domain = DOMAIN(actual).top_domain_under_public_suffix
                 log.info("Official corporate domain verified: %s; company identity in title/content and branded registrable domain", self.ecosystem.official_corporate_domain)
@@ -286,16 +344,29 @@ class IRDiscovery:
                         log.info("IR link discovered from official corporate site: %s officiality=%s evidence=%s", candidate.url, candidate.officiality_score, candidate.evidence)
                 return result
             except Exception as exc:
+                error_text = str(exc)
+                failure_code = getattr(exc, "code", "")
+                lower = error_text.casefold()
+                domain_code = "CORPORATE_DOMAIN_DNS_FAILED" if any(token in lower for token in ("name or service not known", "name_not_resolved", "nodename", "dns", "getaddrinfo")) else "CORPORATE_DOMAIN_HTTP_FAILED"
+                if domain_candidate:
+                    domain_candidate.resolution_status = "FAILED"
+                    domain_candidate.verification_status = "REJECTED"
+                    self._domain_event(domain_code, domain_candidate, error_text)
                 self.cache.failure(url,getattr(exc,"code",type(exc).__name__))
-                self.errors.append(Issue(getattr(exc, "code", "CORPORATE_DISCOVERY_FAILED"), str(exc), url))
+                self.errors.append(Issue(failure_code or "CORPORATE_DISCOVERY_FAILED", error_text, url))
                 log.warning("Corporate candidate failed %s: %s", url, exc)
         return []
 
-    async def discover_investor_relations_site(self, ticker: str, company_name: str, context) -> IRCandidate | None:
+    async def discover_investor_relations_site(self, ticker: str, company_name: str, context, *, issuer_cik: str | None = None) -> IRCandidate | None:
         stock = Stock(ticker, company_name, "", 0)
         page = await context.new_page()
         try:
-            self.identity=identify(company_name);self.ticker=ticker
+            self.identity=identify(company_name);self.ticker=ticker;self.issuer_cik=issuer_cik
+            generated = generated_candidates(company_name)
+            for candidate in generated:
+                if not any(item.domain == candidate.domain for item in self.domain_candidates):
+                    self.domain_candidates.append(candidate)
+                    self._domain_event("CORPORATE_DOMAIN_CANDIDATE_GENERATED", candidate, "Deterministic brand/legal-name candidate generation")
             normalized=self.identity.normalized_company_name
             from .company_identity import SECURITY
             legal_query=SECURITY.sub('',company_name).strip(' ,.-')
@@ -323,8 +394,11 @@ class IRDiscovery:
                 queue.extend(IRCandidate(u,evidence=['Search result; evaluating independent ownership evidence']) for u in ir_results)
                 if queue:break
             if not queue and not self.ecosystem.official_corporate_domain:
-                # Normalized brand guesses remain untrusted until full page identity and navigation verify them.
-                guesses=['https://'+d+'/' for d in corporate_domains(company_name)[:2]]
+                # Normalized brand guesses remain untrusted until full page
+                # identity and navigation verify them.  A failed first guess
+                # is deliberately just a candidate failure; discovery keeps
+                # trying the deterministic remainder.
+                guesses=[candidate.url for candidate in deterministic_domain_order(generated)]
                 queue.extend(await self.discover_ir_from_corporate_site(page,guesses,company_name))
             if not queue and self.ecosystem.official_corporate_domain:
                 query=f'site:{self.ecosystem.official_corporate_domain} investors'
@@ -335,7 +409,11 @@ class IRDiscovery:
             while queue and len(seen) < min(self.browser.config.max_discovery_candidates,MAX_SCAN_NETWORK_CANDIDATES if self.scan_budget else self.browser.config.max_discovery_candidates):
                 if self.scan_budget and self.browser_probes>=MAX_SCAN_BROWSER_PROBES:break
                 candidate = queue.pop(0)
-                if candidate.url in seen or rejected_domain(candidate.url):
+                if candidate.url in seen:
+                    continue
+                if rejected_domain(candidate.url):
+                    rejected_candidate = candidate_from_url(candidate.url, source_type="ir_discovery", source_reference=candidate.url)
+                    self._domain_event("CORPORATE_DOMAIN_REJECTED", rejected_candidate, "Candidate belongs to a blocked or third-party domain")
                     continue
                 seen.add(candidate.url)
                 # Independent domain evidence can establish an IR subdomain discovered in search.
@@ -355,6 +433,13 @@ class IRDiscovery:
                     candidate.corporate_url=self.ecosystem.official_corporate_url
                 # Preserve ownership evidence before any network access.
                 self.candidates.append(candidate)
+                ir_domain_candidate = next((item for item in self.domain_candidates if item.url == canonicalize_url(candidate.url)), None)
+                if ir_domain_candidate is None:
+                    ir_domain_candidate = candidate_from_url(candidate.url, source_type="ir_discovery", source_reference=candidate.url, confidence="MEDIUM")
+                    if ir_domain_candidate:
+                        self.domain_candidates.append(ir_domain_candidate)
+                if ir_domain_candidate:
+                    self._domain_event("IR_URL_DISCOVERED", ir_domain_candidate, "Investor-relations candidate queued for verification")
                 if self.cache.blocked(candidate.url):
                     from .models import AccessResult
                     candidate.access=AccessResult(blocked=True,error='Short-lived cached transport failure')
@@ -390,6 +475,11 @@ class IRDiscovery:
                         candidate.officiality_score = score.score
                     candidate.evidence.extend(score.reasons)
                     if candidate.official and candidate.content_validated:
+                        if ir_domain_candidate:
+                            ir_domain_candidate.resolution_status = "VERIFIED"
+                            ir_domain_candidate.http_status = candidate.access.http_status or candidate.access.browser_status
+                            classify_verified(ir_domain_candidate, identity_match=True, ir_link_found=True, redirect_target=final if final != candidate.url else None)
+                            self._domain_event("IR_URL_VERIFIED", ir_domain_candidate, "IR page passed independent issuer verification")
                         # Only a company-identifying IR page can establish a cross-domain redirect alias.
                         if final != candidate.url and score.score >= 75:
                             redirected = IRCandidate(final, candidate.officiality_score, ["Redirect from verified IR URL"], True)
@@ -417,6 +507,7 @@ class IRDiscovery:
                 self.ecosystem.official_ir_domain = urlsplit(winner.url).hostname
                 log.info("IR selected: %s official=%s accessible=%s", winner.url, winner.official, winner.access.browser_accessible)
                 return winner
+            self._domain_event("IR_DISCOVERY_EXHAUSTED", message="All deterministic and discovered corporate/IR candidates were rejected or unusable")
             return None
         finally:
             await page.close()

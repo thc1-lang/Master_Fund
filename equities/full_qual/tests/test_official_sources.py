@@ -11,6 +11,7 @@ from qualitative_ir_downloader.official_sources import (
     SOURCE_SEC,
     SOURCE_STATIC,
 )
+from qualitative_ir_downloader.report_accounting import report_document_type
 from qualitative_ir_downloader.production_status import aggregate_status
 
 
@@ -44,6 +45,24 @@ class OfficialSourceFallbackTests(unittest.IsolatedAsyncioTestCase):
             official_corporate_domain="acme.com",
             official_corporate_url="https://acme.com/",
             verified_ir_urls=["https://investor.acme.com/"],
+        )
+
+    def test_foreign_sec_forms_retain_report_semantics(self):
+        self.assertEqual(
+            report_document_type({
+                "title": "ACME 20-F 2025",
+                "source_url": "https://www.sec.gov/Archives/annual.htm",
+                "provenance": [{"form_type": "20-F"}],
+            }),
+            "annual_report",
+        )
+        self.assertEqual(
+            report_document_type({
+                "title": "ACME 6-K Half-Year Results",
+                "source_url": "https://www.sec.gov/Archives/current.htm",
+                "provenance": [{"form_type": "6-K"}],
+            }),
+            "interim_report",
         )
 
     async def test_primary_blocked_financial_and_newsroom_fallbacks_are_usable(self):
@@ -111,6 +130,39 @@ class OfficialSourceFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sec_docs), 2)
         self.assertEqual(sec_docs[0].provenance[0]["issuer_cik"], "0000001234")
         self.assertEqual(sec_docs[0].provenance[0]["accession_number"], "0000000000-26-000001")
+
+    async def test_sec_fallback_supports_foreign_issuer_20f_and_6k(self):
+        submissions = {
+            "filings": {"recent": {
+                "form": ["20-F", "6-K", "3"],
+                "accessionNumber": [
+                    "0000000000-26-000010",
+                    "0000000000-26-000011",
+                    "0000000000-26-000012",
+                ],
+                "primaryDocument": ["annual.htm", "current.htm", "ownership.xml"],
+                "filingDate": ["2026-03-01", "2026-08-15", "2026-08-20"],
+                "reportDate": ["2025-12-31", "2026-06-30", "2026-08-20"],
+            }}
+        }
+
+        async def fetch(url, referer):
+            return Response(url, "blocked", 403)
+
+        async def sec_fetch(url):
+            return submissions
+
+        with tempfile.TemporaryDirectory() as temp:
+            ecosystem = IREcosystem(official_corporate_domain="acme.co.uk", official_corporate_url="https://acme.co.uk/")
+            result = await OfficialSourceStrategy(
+                browser(temp), None, self.stock(), ecosystem, None,
+                fetcher=fetch, sec_fetcher=sec_fetch, issuer_cik="0000001234",
+            ).discover()
+        sec_docs = [doc for doc in result["documents"] if doc.source_family == SOURCE_SEC]
+        self.assertEqual({doc.provenance[0]["form_type"] for doc in sec_docs}, {"20-F", "6-K"})
+        self.assertEqual({doc.provenance[0]["accession_number"] for doc in sec_docs}, {
+            "0000000000-26-000010", "0000000000-26-000011",
+        })
 
     async def test_duplicate_release_across_verified_routes_is_merged_with_provenance(self):
         html = """

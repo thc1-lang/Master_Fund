@@ -16,18 +16,22 @@ from .urls import canonicalize_url, public_url
 from .network import ResourceClient
 from .structured import wire_link, WIRE_HOSTS
 from .archival_pdf import render_archival
+from .document_targets import DocumentTarget, resolve_document_target
 
 log = logging.getLogger(__name__)
 
 class Downloader:
-    def __init__(self, browser: Browser, context, folder: Path, ticker: str, company_name: str = ""):
+    def __init__(self, browser: Browser, context, folder: Path, ticker: str, company_name: str = "", issuer_context=None):
         self.browser, self.context, self.folder, self.ticker = browser, context, folder, ticker
         self.company_name = company_name or ticker
+        self.issuer_context = issuer_context
         self.hashes: dict[str, str] = {}
         self.urls: dict[str, Document] = {}
         self.existing: dict[str, dict] = {}
+        self.resolved_existing: dict[str, dict] = {}
         self.cache_hits = 0
         self.network_requests_avoided = 0
+        self.last_pdf_response: dict[str, object] = {}
 
     def register_existing(self, records: list[dict]) -> None:
         """Register manifest records eligible for identity-validated reuse."""
@@ -35,10 +39,17 @@ class Downloader:
             key = canonicalize_url(str(record.get("source_url", "")))
             if key:
                 self.existing[key] = record
+            resolved = canonicalize_url(str(record.get("resolved_document_url") or record.get("pdf_source_url") or ""))
+            if resolved:
+                self.resolved_existing[resolved] = record
 
-    def _existing_valid(self, document: Document, record: dict) -> bool:
-        if canonicalize_url(document.source_url) != canonicalize_url(str(record.get("source_url", ""))):
+    def _existing_valid(self, document: Document, record: dict, resolved_url: str | None = None) -> bool:
+        if resolved_url is None and canonicalize_url(document.source_url) != canonicalize_url(str(record.get("source_url", ""))):
             return False
+        if resolved_url is not None:
+            previous_resolved = canonicalize_url(str(record.get("resolved_document_url") or record.get("pdf_source_url") or record.get("source_url") or ""))
+            if previous_resolved != resolved_url and canonicalize_url(document.source_url) != canonicalize_url(str(record.get("source_url", ""))):
+                return False
         if record.get("category") and record.get("category") != document.category:
             return False
         if record.get("date") and document.date and str(record.get("date")) != str(document.date):
@@ -61,27 +72,66 @@ class Downloader:
                 return False
         return True
 
+    def _apply_target(self, document: Document, target: DocumentTarget) -> None:
+        """Copy wrapper-resolution evidence onto the manifest document."""
+        document.original_source_url = document.original_source_url or document.source_url
+        document.wrapper_detected = bool(target.wrapper_detected)
+        document.wrapper_type = target.wrapper_type
+        document.wrapper_resolution_method = target.resolution_method
+        document.resolved_document_url = target.canonical_document_url or document.source_url
+        document.resolution_confidence = target.confidence
+        document.document_type_hint = target.document_type_hint
+        if target.diagnostics:
+            marker = {
+                "wrapper_url": document.source_url,
+                "resolved_document_url": target.canonical_document_url,
+                "resolution_method": target.resolution_method,
+                "wrapper_type": target.wrapper_type or "",
+                "resolution_confidence": target.confidence,
+                "diagnostics": ";".join(target.diagnostics),
+                "relation": "document_wrapper_resolution",
+            }
+            if not any(item.get("relation") == marker["relation"] and item.get("resolved_document_url") == marker["resolved_document_url"] for item in document.provenance):
+                document.provenance.append(marker)
+
     async def fetch_pdf(self, url: str, referer: str) -> tuple[bytes, str]:
         from .network import ResourceClient
         client = ResourceClient(self.browser, self.context)
-        current, seen = url, set()
+        initial = resolve_document_target(url, issuer_context=self.issuer_context)
+        current = initial.canonical_document_url or url
+        seen = set()
+        self.last_pdf_response = {
+            "original_url": url,
+            "resolved_document_url": current,
+            "resolution_method": initial.resolution_method,
+            "wrapper_detected": initial.wrapper_detected,
+        }
         for _ in range(int(getattr(self.browser.config, "max_redirects", 8))):
             if not public_url(current) or current in seen:
                 raise CollectionError("PDF_DOWNLOAD_FAILED", f"Invalid viewer URL or cycle: {current}")
             seen.add(current)
             response = await client.get(current, referer)
             data = response.body
+            content_type = str((response.headers or {}).get("content-type", ""))
+            self.last_pdf_response.update({
+                "resolved_document_url": response.url,
+                "resolved_content_type": content_type,
+                "resolved_http_status": response.status,
+            })
             if data.lstrip().startswith(b"%PDF-"):
                 validate_pdf(data)
                 return data, response.url
-            soup = BeautifulSoup(data, "html.parser")
-            viewer = soup.select_one('iframe[src], embed[src], object[data]')
-            target = (viewer.get("src") or viewer.get("data")) if viewer else None
-            if not target:
-                target = next((a.get("href") for a in soup.select("a[href]") if is_pdf(Link(str(a.get("href")), a.get_text(" ", strip=True)))), None)
-            if not target:
-                raise CollectionError("PDF_DOWNLOAD_FAILED", f"Expected PDF, received {response.headers.get('content-type', '')}: {response.url}")
-            current = urljoin(response.url, str(target))
+            target = resolve_document_target(response.url, response, self.issuer_context)
+            if target.canonical_document_url and target.canonical_document_url != response.url and target.identity_eligible:
+                self.last_pdf_response.update({
+                    "resolved_document_url": target.canonical_document_url,
+                    "resolution_method": target.resolution_method,
+                    "wrapper_detected": target.wrapper_detected,
+                    "wrapper_type": target.wrapper_type,
+                })
+                current = target.canonical_document_url
+                continue
+            raise CollectionError("PDF_DOWNLOAD_FAILED", f"Expected PDF, received {content_type}: {response.url}")
         raise CollectionError("PDF_DOWNLOAD_FAILED", "Too many document viewers")
 
     async def save(self, document: Document) -> Document:
@@ -102,30 +152,48 @@ class Downloader:
 
     async def _save(self, document: Document) -> Document:
         key = canonicalize_url(document.source_url)
+        target = resolve_document_target(document.pdf_source_url or document.source_url, issuer_context=self.issuer_context)
+        self._apply_target(document, target)
+        resolved_key = canonicalize_url(target.canonical_document_url or document.source_url)
         existing = self.existing.get(key)
-        if existing and self._existing_valid(document, existing):
+        resolved_existing = self.resolved_existing.get(resolved_key)
+        if resolved_existing and self._existing_valid(document, resolved_existing, resolved_key):
+            existing = resolved_existing
+        if existing and self._existing_valid(document, existing, resolved_key if existing is resolved_existing else None):
             document.local_filename = existing.get("local_filename")
             document.sha256 = existing.get("sha256")
             document.method = existing.get("method") or document.method
             document.pdf_source_url = existing.get("pdf_source_url") or document.pdf_source_url
             document.download_url = existing.get("download_url") or document.download_url
+            document.resolved_document_url = existing.get("resolved_document_url") or document.resolved_document_url
+            document.artifact_url = document.resolved_document_url or existing.get("artifact_url") or document.artifact_url
+            document.resolved_content_type = existing.get("resolved_content_type") or document.resolved_content_type
+            document.resolved_http_status = existing.get("resolved_http_status") or document.resolved_http_status
             document.cache_hit = True
             self.cache_hits += 1
             self.network_requests_avoided += 1
             self.urls[key] = document
+            self.urls[resolved_key] = document
             log.info("Reused cached artifact: %s", document.local_filename)
             return document
-        if key in self.urls:
-            previous = self.urls[key]
+        if resolved_key in self.urls or key in self.urls:
+            previous = self.urls.get(resolved_key) or self.urls[key]
             document.local_filename, document.sha256 = previous.local_filename, previous.sha256
             document.method, document.pdf_source_url = previous.method, previous.pdf_source_url
             document.duplicate_of = previous.local_filename
+            document.resolved_document_url = previous.resolved_document_url or document.resolved_document_url
             return document
         data, last_error = None, None
-        for asset in list(dict.fromkeys(([document.pdf_source_url] if document.pdf_source_url else []) + document.alternate_pdf_urls)):
+        resolved_assets = [document.resolved_document_url] if document.pdf_source_url or target.wrapper_detected or target.resolution_method != "UNKNOWN" else []
+        assets = list(dict.fromkeys([asset for asset in (resolved_assets + ([document.pdf_source_url] if document.pdf_source_url else []) + document.alternate_pdf_urls) if asset]))
+        for asset in assets:
             try:
                 data, actual = await self.fetch_pdf(asset, document.linked_from_url or document.source_url)
                 document.pdf_source_url, document.method = actual, "official_pdf"
+                document.resolved_document_url = actual
+                document.artifact_url = actual
+                document.resolved_content_type = self.last_pdf_response.get("resolved_content_type")
+                document.resolved_http_status = self.last_pdf_response.get("resolved_http_status")
                 break
             except Exception as exc:
                 last_error = exc
@@ -155,6 +223,7 @@ class Downloader:
             self.hashes[digest] = document.local_filename
             log.info("%s: %s", "Downloaded original PDF" if document.method == "official_pdf" else "HTML release converted to PDF", document.local_filename)
         self.urls[key] = document
+        self.urls[canonicalize_url(document.resolved_document_url or document.pdf_source_url or document.source_url)] = document
         return document
 
     async def retrieve_sec(self, document: Document) -> bytes:

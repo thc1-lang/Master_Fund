@@ -1,6 +1,6 @@
 # Qualitative IR Downloader - Phase 1
 
-A sequential, headless Python collection application for investor-relations news releases and investor report PDFs. It reads Google Sheets, discovers official IR pages, traverses their exposed archives, downloads original PDFs, and prints HTML-only releases with Chromium. It does not analyze documents or write to the spreadsheet.
+A sequential, headless Python collection application for investor-relations news releases and investor report PDFs. It reads Google Sheets, discovers official IR pages, traverses their exposed archives, downloads original PDFs, and prints HTML-only releases with Chromium. Full Qual V4 consumes those production artifacts and can publish the finalized dossier to one persistent Google Sheets ticker tab; the local dossier remains authoritative.
 
 ## Setup (Windows PowerShell)
 
@@ -21,9 +21,45 @@ The service-account file defaults to:
 C:\Code\service_account.json
 ```
 
-Enable the Google Sheets API in the service account's Google Cloud project. Share [the spreadsheet](https://docs.google.com/spreadsheets/d/1QF67DQEDF5QB8-q1JCuzyYPXSPJugxCMQ8DbUhOo_1c/edit) with the **client_email** from that JSON file, with Viewer access. Keep the private key out of source control and logs. The application requests only the `spreadsheets.readonly` scope and opens the sheet by ID; no Drive write scope is used.
+Enable the Google Sheets API in the service account's Google Cloud project. Share [the publication workbook](https://docs.google.com/spreadsheets/d/1GKmx61XDkLYvui2tA1lsU1K76CO9fUm2LN_7Vaf8kgU/edit) with the **client_email** from that JSON file, with Editor access when publication is enabled. Keep the private key out of source control and logs. Read-only acquisition-sheet access continues to use the `spreadsheets.readonly` scope; publication uses the Sheets write scope only for the explicitly selected ticker tab.
 
 Read-only authentication follows the [gspread authentication API](https://docs.gspread.org/en/v5.6.0/api/auth.html). Browser printing and interactions use the [Playwright Python API](https://playwright.dev/python/docs/api/class-page).
+
+## Full Qual V4 Google Sheets publication
+
+The final `pipeline_runner` stage publishes the completed V4 dossier to the
+institutional workbook `1GKmx61XDkLYvui2tA1lsU1K76CO9fUm2LN_7Vaf8kgU`. The
+service account path is resolved as `--google-service-account`, then
+`FULL_QUAL_GOOGLE_SERVICE_ACCOUNT`, then `C:\Code\service_account.json`.
+Share the workbook with the credential's `client_email`; only that email is
+shown in diagnostics. Private keys and tokens are never logged.
+
+Each ticker has one persistent tab (for example `JPM` or `WMT`). The publisher
+reads managed metadata, uses stable record keys and canonical content hashes,
+preserves analyst notes and first/last-change timestamps, and retains
+temporarily unavailable prior records as stale rather than deleting them.
+Technical metadata is hidden at the right of the report. The vertical report
+uses section-specific tables for the dashboard, KPIs, drivers, management,
+governance, risks, scoring, PIT and acquisition registry; no raw PDF/HTML or
+nested JSON is placed in cells. Every cell is checked against the 40,000
+character safety limit. The schema is `full-qual-sheet-v5`, with a compact PM
+decision surface followed by an auditable deep evidence archive. V5 adds
+evidence-constrained company economics, measurable KPI and driver handoff
+records, non-Cartesian causal relationships, risk/catalyst filtering, and
+authoritative period/source status while preserving the V3 worksheet layout.
+
+Publication snapshots are written after a successful update to
+`<data-root>\<TICKER>\12_Google_Sheets\<TICKER>_<AS_OF_DATE>_sheet-publication.json`.
+Research execution and Sheets publication statuses are separate: a local
+dossier remains valid during a Sheets outage, while the run summary reports
+`RESEARCH_STATUS=SUCCESS` and `GOOGLE_SHEETS_STATUS=FAILED` (exit code 6).
+Use `--no-google-sheets` for deterministic offline tests or development.
+
+Example:
+
+```powershell
+.\.venv\Scripts\python.exe -m pipeline_runner --ticker JPM --as-of-date 2026-09-25 --profile core_v2 --mode existing --google-service-account C:\Code\service_account.json
+```
 
 ## Run
 

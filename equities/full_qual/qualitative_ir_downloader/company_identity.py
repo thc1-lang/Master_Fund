@@ -4,7 +4,11 @@ import re
 import unicodedata
 
 SECURITY=re.compile(r'\b(?:sponsored\s+(?:ADR|ADS)|American\s+Depositary\s+(?:Shares|Receipts)|ordinary\s+shares|common\s+stock|class\s+[A-Z](?:\s+(?:shares|stock))?|ADR|ADS)\b',re.I)
-LEGAL=re.compile(r'(?:[\s,.-]+)(?:incorporated|inc|corporation|corp|limited|ltd|plc|holdings|holding)\.?$',re.I)
+# Legal suffixes are identity noise, not brand names.  Keep this deliberately
+# conservative: strip only well-known corporate designators (including the
+# multi-token forms commonly returned by SEC registrant metadata), never an
+# arbitrary trailing word that might be part of the public brand.
+LEGAL=re.compile(r'(?:[\s,.-]+)(?:public\s+(?:limited|ltd\.?)(?:\s+company|\s+co\.?)?|limited|ltd|plc|incorporated|inc|corporation|corp|ag|se|n\.?v\.?|s\.?a\.?|s\.?p\.?a\.?|ab|asa|oyj|pte\s+ltd|holdings|holding)\.?$',re.I)
 
 def fold(text):return ''.join(re.findall(r'[a-z0-9]+',unicodedata.normalize('NFKC',text).casefold()))
 

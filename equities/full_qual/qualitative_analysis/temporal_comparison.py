@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import re
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from calendar import monthrange
+from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from .extraction_models import QualitativeClaim
@@ -15,11 +16,17 @@ from .topic_normalization import TopicIdentity, topic_identity
 from .fiscal_periods import canonical_period_label, canonical_period_identity
 
 
-COMPARISON_VERSION = "temporal-comparison-v2"
+COMPARISON_VERSION = "temporal-comparison-v3"
 RULES_VERSION = "temporal-rules-v2"
-PROVIDER_VERSION = "deterministic-temporal-v2"
+PROVIDER_VERSION = "deterministic-temporal-v3"
 
 ACTUAL_PERIOD_TYPES = {"QUARTER_ACTUAL", "ANNUAL_ACTUAL", "YTD_ACTUAL"}
+
+FUTURE_PERIODS_EXCLUDED = "FUTURE_PERIODS_EXCLUDED"
+FUTURE_PERIOD_CANDIDATES = "FUTURE_PERIOD_CANDIDATES"
+UNKNOWN_PERIOD_END_EXCLUDED = "UNKNOWN_PERIOD_END_EXCLUDED"
+FORWARD_LOOKING_PERIODS_EXCLUDED = "FORWARD_LOOKING_PERIODS_EXCLUDED"
+PERIODS_WITHOUT_OBSERVED_CLAIMS_EXCLUDED = "PERIODS_WITHOUT_OBSERVED_CLAIMS_EXCLUDED"
 
 
 def period_type(value: Any) -> str:
@@ -49,6 +56,176 @@ def claims_available_as_of(claims: Sequence[QualitativeClaim], as_of_date: str |
     if not as_of_date:
         return list(claims)
     return [claim for claim in claims if not (getattr(claim, "public_availability_date", None) or claim.available_date) or str(getattr(claim, "public_availability_date", None) or claim.available_date)[:10] <= as_of_date]
+
+
+def _date_value(value: Any) -> date | None:
+    if value is None or value == "":
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _calendar_period_end(claim: QualitativeClaim) -> date | None:
+    """Resolve a missing period end only from issuer calendar evidence.
+
+    A default month-end calendar is safe for calendar-year issuers.  For
+    non-calendar or week-based issuers we require an explicit boundary from
+    the issuer calendar; guessing a nominal Q4 end would reintroduce the
+    future-period leak this layer is intended to prevent.
+    """
+    explicit = _date_value(getattr(claim, "period_end_date", None))
+    if explicit:
+        return explicit
+    year = getattr(claim, "fiscal_year", None)
+    quarter = getattr(claim, "fiscal_quarter", None)
+    calendar = dict(getattr(claim, "issuer_fiscal_calendar", {}) or {})
+    if not isinstance(year, int) or quarter not in {1, 2, 3, 4}:
+        return None
+
+    boundaries = calendar.get("quarter_boundaries")
+    if isinstance(boundaries, dict):
+        for key in (f"Q{quarter}", str(quarter)):
+            value = boundaries.get(key)
+            if isinstance(value, dict):
+                value = value.get("end_date")
+            resolved = _date_value(value)
+            if resolved:
+                return resolved
+
+    calendar_type = str(calendar.get("calendar_type") or "").lower()
+    fiscal_end_month = calendar.get("fiscal_year_end_month")
+    if calendar_type in {"", "calendar"} and fiscal_end_month in {None, 12, "12"}:
+        # For a calendar-year issuer, the fiscal-year label is the ending
+        # year and quarter ends are the ordinary calendar quarter ends.
+        month = quarter * 3
+        return date(year, month, monthrange(year, month)[1])
+    return None
+
+
+def _period_role(claim: QualitativeClaim) -> str:
+    explicit = str(getattr(claim, "period_role", "") or "").upper()
+    if explicit in {"OBSERVED_PERIOD", "FORWARD_LOOKING_PERIOD", "REFERENCE_PERIOD", "UNKNOWN_PERIOD_ROLE"}:
+        return explicit
+    # These optional fields are accepted for newer serialized claims without
+    # requiring a claim-schema change for older artifacts.
+    if getattr(claim, "referenced_period", None) and not getattr(claim, "observation_period", None):
+        return "REFERENCE_PERIOD"
+    status = str(getattr(claim, "temporal_status", "") or "").upper()
+    if status in {"FUTURE", "FORWARD", "FORWARD_LOOKING", "PROSPECTIVE"}:
+        return "FORWARD_LOOKING_PERIOD"
+    return "OBSERVED_PERIOD"
+
+
+def _period_candidate_label(values: Sequence[QualitativeClaim]) -> str:
+    return period_label(values) if values else "UNKNOWN"
+
+
+def eligible_observed_claims(
+    claims: Sequence[QualitativeClaim],
+    *,
+    as_of_date: str | None = None,
+) -> tuple[list[QualitativeClaim], dict[str, Any]]:
+    """Filter claims to periods eligible for point-in-time chronology.
+
+    This deliberately does not delete or rewrite claims.  It only controls
+    which claims can supply an observed period to temporal comparison.  A
+    guidance/reference claim remains in the extraction store and can be used
+    by guidance, catalyst, or other forward-looking consumers.
+    """
+    cutoff = _date_value(as_of_date)
+    groups = period_groups(claims)
+    retained: list[QualitativeClaim] = []
+    excluded: list[dict[str, str]] = []
+    diagnostics: dict[str, Any] = {
+        "future_period_candidates": [],
+        "future_periods_excluded": [],
+        "unknown_period_end": [],
+        "forward_looking_periods": [],
+        "periods_without_observed_claims": [],
+        "duplicate_canonicalized": 0,
+    }
+
+    for _key, values in groups.items():
+        # Count alternate representations of one fiscal coordinate, rather
+        # than the many claims normally present in a period.
+        representations = {
+            (
+                period_type(item),
+                getattr(item, "fiscal_year", None),
+                getattr(item, "fiscal_quarter", None),
+                str(getattr(item, "period_end_date", "") or "")[:10] or "unknown",
+            )
+            for item in values
+        }
+        if len(representations) > 1:
+            diagnostics["duplicate_canonicalized"] += len(representations) - 1
+
+        label = _period_candidate_label(values)
+        observed_values: list[QualitativeClaim] = []
+        reasons: set[tuple[str, str]] = set()
+        for claim in values:
+            claim_type = period_type(claim)
+            role = _period_role(claim)
+            if claim_type not in ACTUAL_PERIOD_TYPES:
+                reasons.add((PERIODS_WITHOUT_OBSERVED_CLAIMS_EXCLUDED, "NON_OBSERVED_PERIOD_TYPE"))
+                continue
+            if role in {"FORWARD_LOOKING_PERIOD", "REFERENCE_PERIOD", "UNKNOWN_PERIOD_ROLE"}:
+                # UNKNOWN_PERIOD_ROLE is only excluded when the serialized
+                # claim explicitly declares it; legacy claims default to the
+                # observed role above.
+                if role != "OBSERVED_PERIOD":
+                    reasons.add((FORWARD_LOOKING_PERIODS_EXCLUDED, "FORWARD_LOOKING_REFERENCE_ONLY"))
+                    continue
+
+            if cutoff is not None:
+                available = _date_value(getattr(claim, "public_availability_date", None) or getattr(claim, "available_date", None))
+                if available is None:
+                    reasons.add((UNKNOWN_PERIOD_END_EXCLUDED, "PIT_ELIGIBILITY_UNKNOWN"))
+                    continue
+                if available > cutoff:
+                    reasons.add((FUTURE_PERIOD_CANDIDATES, "SOURCE_PUBLICATION_AFTER_AS_OF_DATE"))
+                    continue
+                end = _calendar_period_end(claim)
+                if end is None:
+                    reasons.add((UNKNOWN_PERIOD_END_EXCLUDED, "PIT_ELIGIBILITY_UNKNOWN"))
+                    continue
+                if end > cutoff:
+                    reasons.add((FUTURE_PERIOD_CANDIDATES, "FUTURE_PERIOD_END_AFTER_AS_OF_DATE"))
+                    continue
+            observed_values.append(claim)
+
+        if observed_values:
+            retained.extend(observed_values)
+            continue
+        if not reasons:
+            continue
+        for diagnostic, reason in sorted(reasons):
+            excluded.append({"period": label, "reason": reason, "diagnostic": diagnostic})
+            if diagnostic == FUTURE_PERIOD_CANDIDATES:
+                diagnostics["future_period_candidates"].append(label)
+                diagnostics["future_periods_excluded"].append(label)
+            elif diagnostic == UNKNOWN_PERIOD_END_EXCLUDED:
+                diagnostics["unknown_period_end"].append(label)
+            elif diagnostic == FORWARD_LOOKING_PERIODS_EXCLUDED:
+                diagnostics["forward_looking_periods"].append(label)
+            elif diagnostic == PERIODS_WITHOUT_OBSERVED_CLAIMS_EXCLUDED:
+                diagnostics["periods_without_observed_claims"].append(label)
+
+    # Keep metadata deterministic when a period has many excluded claims.
+    for key in ("future_period_candidates", "future_periods_excluded", "unknown_period_end", "forward_looking_periods", "periods_without_observed_claims"):
+        diagnostics[key] = sorted(set(diagnostics[key]))
+    # Preserve the public diagnostic taxonomy in machine-readable metadata as
+    # well as the snake-case convenience keys used by the CLI/tests.
+    diagnostics[FUTURE_PERIODS_EXCLUDED] = diagnostics["future_periods_excluded"]
+    diagnostics[FUTURE_PERIOD_CANDIDATES] = diagnostics["future_period_candidates"]
+    diagnostics[UNKNOWN_PERIOD_END_EXCLUDED] = diagnostics["unknown_period_end"]
+    diagnostics[FORWARD_LOOKING_PERIODS_EXCLUDED] = diagnostics["forward_looking_periods"]
+    diagnostics[PERIODS_WITHOUT_OBSERVED_CLAIMS_EXCLUDED] = diagnostics["periods_without_observed_claims"]
+    diagnostics["excluded_periods"] = sorted(excluded, key=lambda item: (item["period"], item["diagnostic"], item["reason"]))
+    diagnostics["as_of_date"] = as_of_date
+    return retained, diagnostics
 
 
 def period_sort_key(claim_or_period: Any) -> tuple[int, int, str, str]:
@@ -157,7 +334,7 @@ def _available_period_labels(ordered: Sequence[tuple[Any, list[QualitativeClaim]
     return rendered
 
 
-def select_latest_vs_previous(claims: Sequence[QualitativeClaim], horizon: str | None = None) -> tuple[list[QualitativeClaim], list[QualitativeClaim], list[str]] | None:
+def _select_latest_vs_previous(claims: Sequence[QualitativeClaim], horizon: str | None = None) -> tuple[list[QualitativeClaim], list[QualitativeClaim], list[str]] | None:
     groups = period_groups(claims)
     # Guidance horizons and unknown references are never ordinary sequential
     # reporting periods. If quarters exist, compare quarters with quarters;
@@ -178,6 +355,17 @@ def select_latest_vs_previous(claims: Sequence[QualitativeClaim], horizon: str |
     if len(ordered) < 2:
         return None
     return ordered[-2][1], ordered[-1][1], available
+
+
+def select_latest_vs_previous(
+    claims: Sequence[QualitativeClaim],
+    horizon: str | None = None,
+    *,
+    as_of_date: str | None = None,
+) -> tuple[list[QualitativeClaim], list[QualitativeClaim], list[str]] | None:
+    """Select adjacent observed periods, applying PIT eligibility first."""
+    eligible, _diagnostics = eligible_observed_claims(claims, as_of_date=as_of_date)
+    return _select_latest_vs_previous(eligible, horizon=horizon)
 
 
 def _base_key(claim: QualitativeClaim) -> tuple[str, str, str]:
@@ -387,13 +575,32 @@ def validate_temporal_changes(changes: Sequence[TemporalChange], previous_claims
     return errors
 
 
-def compare_latest_vs_previous(ticker: str, claims: Sequence[QualitativeClaim], dimension: str | None = None, provider: TemporalComparisonProvider | None = None, horizon: str | None = None) -> TemporalComparisonResult:
+def compare_latest_vs_previous(
+    ticker: str,
+    claims: Sequence[QualitativeClaim],
+    dimension: str | None = None,
+    provider: TemporalComparisonProvider | None = None,
+    horizon: str | None = None,
+    *,
+    as_of_date: str | None = None,
+) -> TemporalComparisonResult:
     scoped = [claim for claim in claims if claim.ticker.upper() == ticker.upper() and (dimension is None or claim.dimension == dimension)]
-    selected = select_latest_vs_previous(scoped, horizon=horizon)
+    eligible_claims, eligibility = eligible_observed_claims(scoped, as_of_date=as_of_date)
+    selected = _select_latest_vs_previous(eligible_claims, horizon=horizon)
+    groups = period_groups(eligible_claims)
+    eligible_labels = _available_period_labels(sorted(groups.items()))
     if selected is None:
-        groups = period_groups(scoped)
-        return TemporalComparisonResult(ticker=ticker.upper(), status="INSUFFICIENT_PERIODS", available_periods=_available_period_labels(sorted(groups.items())), previous_claims=0, current_claims=0, comparison_horizon=horizon or "unknown")
+        return TemporalComparisonResult(
+            ticker=ticker.upper(), status="INSUFFICIENT_PERIODS", available_periods=eligible_labels,
+            previous_claims=0, current_claims=0, comparison_horizon=horizon or "unknown",
+            as_of_date=as_of_date, eligible_periods=eligible_labels,
+            excluded_periods=eligibility.get("excluded_periods", []),
+            period_diagnostics=eligibility,
+        )
     previous, current, available = selected
+    # ``available`` is deliberately generated from the horizon-specific
+    # eligible groups, not from all period-like labels in the claim store.
+    eligible_labels = available
     integrity_failures: list[str] = []
     if period_type(previous[0]) == period_type(current[0]) == "QUARTER_ACTUAL":
         previous_key, current_key = period_sort_key(previous[0]), period_sort_key(current[0])
@@ -406,12 +613,23 @@ def compare_latest_vs_previous(ticker: str, claims: Sequence[QualitativeClaim], 
                 available_periods=available, from_period=period_label(previous), to_period=period_label(current),
                 previous_claims=len(previous), current_claims=len(current), comparison_horizon=horizon or "quarterly",
                 candidates_generated=len(current), records_rejected=len(current), period_integrity_failures=integrity_failures,
+                as_of_date=as_of_date, eligible_periods=eligible_labels,
+                excluded_periods=eligibility.get("excluded_periods", []), period_diagnostics=eligibility,
             )
     if not compatible_period_types(previous[0], current[0]):
-        return TemporalComparisonResult(ticker=ticker.upper(), status="NOT_COMPARABLE_PERIOD_TYPES", comparison_status="NOT_COMPARABLE_PERIOD_TYPES", available_periods=available, from_period=period_label(previous), to_period=period_label(current), comparison_horizon=horizon or "unknown")
+        return TemporalComparisonResult(
+            ticker=ticker.upper(), status="NOT_COMPARABLE_PERIOD_TYPES", comparison_status="NOT_COMPARABLE_PERIOD_TYPES",
+            available_periods=available, from_period=period_label(previous), to_period=period_label(current),
+            comparison_horizon=horizon or "unknown", as_of_date=as_of_date, eligible_periods=eligible_labels,
+            excluded_periods=eligibility.get("excluded_periods", []), period_diagnostics=eligibility,
+        )
     resolved_horizon = horizon or ("quarterly" if period_type(previous[0]) == "QUARTER_ACTUAL" else "annual" if period_type(previous[0]) == "ANNUAL_ACTUAL" else "unknown")
     result = (provider or DeterministicTemporalComparisonProvider()).compare(previous, current, period_label(previous), period_label(current), resolved_horizon)
     result.available_periods = available
+    result.as_of_date = as_of_date
+    result.eligible_periods = eligible_labels
+    result.excluded_periods = eligibility.get("excluded_periods", [])
+    result.period_diagnostics = eligibility
     result.comparison_horizon = resolved_horizon
     result.candidates_generated = len(current)
     result.records_accepted = len(result.changes)
@@ -431,4 +649,6 @@ def compare_latest_vs_previous(ticker: str, claims: Sequence[QualitativeClaim], 
 __all__ = [
     "TemporalComparisonProvider", "DeterministicTemporalComparisonProvider", "compare_latest_vs_previous",
     "period_sort_key", "period_groups", "select_latest_vs_previous", "stable_change_id", "validate_temporal_changes", "claims_available_as_of",
+    "eligible_observed_claims", "FUTURE_PERIODS_EXCLUDED", "FUTURE_PERIOD_CANDIDATES",
+    "UNKNOWN_PERIOD_END_EXCLUDED", "FORWARD_LOOKING_PERIODS_EXCLUDED", "PERIODS_WITHOUT_OBSERVED_CLAIMS_EXCLUDED",
 ]

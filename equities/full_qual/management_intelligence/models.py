@@ -13,7 +13,10 @@ from typing import Any
 from qualitative_analysis.schema import PersonRole
 
 
-PARSER_VERSION = "management-person-career-v2"
+# Bumped for the table-aware SEC proxy roster parser and its explicit
+# uppercase-name/committee semantics.  Existing derived rows are therefore
+# rebuilt instead of silently reused under the old parser contract.
+PARSER_VERSION = "management-person-career-v4"
 
 
 def _from_dict(cls, value: dict[str, Any]):
@@ -41,6 +44,7 @@ class OfficialSource:
     retrieved_at: str = ""
     title: str | None = None
     public_availability_date: str | None = None
+    source_role: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -72,11 +76,16 @@ class RoleAssertion:
     source_form_types: list[str] = dc_field(default_factory=list)
     source_url: str | None = None
     local_source_path: str | None = None
+    normalized_document_id: str | None = None
+    source_filed_at: str | None = None
+    source_period: str | None = None
+    as_of_eligibility: str = "ELIGIBLE"
     accession_number: str | None = None
     form_type: str | None = None
     confidence: str = "reported"
     parser_version: str = PARSER_VERSION
     public_availability_date: str | None = None
+    election_status: str = "CURRENT"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -113,6 +122,7 @@ class CareerEntry:
     source_form_types: list[str] = dc_field(default_factory=list)
     source_url: str | None = None
     local_source_path: str | None = None
+    normalized_document_id: str | None = None
     accession_number: str | None = None
     form_type: str | None = None
     confidence: str = "reported"
@@ -151,11 +161,18 @@ class BoardMembership:
     source_form_types: list[str] = dc_field(default_factory=list)
     source_url: str | None = None
     local_source_path: str | None = None
+    normalized_document_id: str | None = None
+    source_filed_at: str | None = None
+    source_period: str | None = None
+    as_of_eligibility: str = "ELIGIBLE"
     accession_number: str | None = None
     form_type: str | None = None
     confidence: str = "reported"
     parser_version: str = PARSER_VERSION
     public_availability_date: str | None = None
+    # CURRENT, NOMINEE, HISTORICAL.  A proxy nominee is not treated as a
+    # seated current director unless the source also establishes that status.
+    board_status: str = "CURRENT"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

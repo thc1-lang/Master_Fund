@@ -17,7 +17,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the frozen qualitative research pipeline",
         epilog="Exit codes: 0=successful or valid partial run, 1=unexpected runner failure, "
-               "2=acquisition failure, 3=normalization failure, 4=invalid configuration/path.",
+               "2=acquisition failure, 3=normalization failure, 4=invalid configuration/path, "
+               "6=Google Sheets publication failure.",
     )
     scope = parser.add_mutually_exclusive_group(required=True)
     scope.add_argument("--ticker")
@@ -35,6 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
     parser.add_argument("--clean-output", action="store_true", help="Delete only the selected ticker production folder before running")
     parser.add_argument("--rebuild-analysis", action="store_true", help="Rebuild derived analytical stages while preserving acquisition/source cache")
+    parser.add_argument("--no-google-sheets", action="store_true", help="Do not publish the completed dossier to Google Sheets")
+    parser.add_argument("--google-spreadsheet-id", help="Google Sheets workbook ID for final publication")
+    parser.add_argument("--google-service-account", help="Service-account JSON path for final publication")
     parser.add_argument("--acquisition-timeout", type=float, default=7200.0,
                         help="Maximum acquisition subprocess wall-clock seconds")
     parser.add_argument("--verbose", action="store_true", help="Print resolved paths, stage details, and exception tracebacks")
@@ -54,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
         # An explicit --ticker is authoritative. Batch --tickers continues to
         # use the worksheet universe and its selection metadata.
         values["manual_ticker"] = bool(args.ticker)
+        values["google_sheets"] = not bool(args.no_google_sheets)
+        values.pop("no_google_sheets", None)
         try:
             result = PipelineRunner(**values).run()
         except Exception as exc:
@@ -119,6 +125,8 @@ def _print_result(result) -> None:
         if stage.name == "acquisition":
             continue
         print(f"{stage.name}: {stage.status.value}")
+    print(f"\nResearch status: {result.research_status}")
+    print(f"Google Sheets status: {result.google_sheets_status}")
     dossier_json = result.dossier_json if result.dossier_json and Path(result.dossier_json).exists() else "NOT_CREATED"
     dossier_markdown = result.dossier_markdown if result.dossier_markdown and Path(result.dossier_markdown).exists() else "NOT_CREATED"
     print(f"\nFinal AI handoff:\n{dossier_json}")

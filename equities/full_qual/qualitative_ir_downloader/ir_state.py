@@ -2,10 +2,12 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import tldextract
 from .filesystem import atomic_json
 from .models import IRCandidate, Stock
 from .urls import public_url, rejected_domain
 from .scoring import company_key
+from .corporate_domain import IMPLEMENTATION_VERSION as DOMAIN_IMPLEMENTATION_VERSION
 
 def cache_path(root: Path) -> Path:
     return Path(root) / "verified_ir.json"
@@ -19,6 +21,8 @@ def read_store(root):
 
 def candidate_from(item, stock):
     if not isinstance(item, dict) or item.get("official") is not True or item.get("invalidated_explicitly"): return None
+    implementation = item.get("domain_resolution_implementation")
+    if implementation and implementation != DOMAIN_IMPLEMENTATION_VERSION: return None
     if company_key(item.get("company_name", "")) != company_key(stock.company_name): return None
     url = item.get("official_ir_url") or item.get("url")
     try:
@@ -27,7 +31,10 @@ def candidate_from(item, stock):
     except (ValueError, TypeError): return None
     evidence = item.get("evidence")
     if not isinstance(evidence, list) or not evidence or not all(isinstance(e,str) for e in evidence): return None
-    return IRCandidate(url, score, evidence, True, corporate_url=item.get("official_corporate_url") or item.get("corporate_url"))
+    corporate_url = item.get("official_corporate_url") or item.get("corporate_url")
+    if not corporate_url and item.get("corporate_domain"):
+        corporate_url = "https://" + str(item["corporate_domain"]).strip("/") + "/"
+    return IRCandidate(url, score, evidence, True, corporate_url=corporate_url)
 
 def load(root, stock):
     try: return candidate_from(read_store(root).get(stock.ticker.upper()), stock)
@@ -44,12 +51,35 @@ def upsert(root, stock, candidate, *, source="discovery", confirmed=False, verif
     data = read_store(root)  # Never silently replace a damaged store.
     key=stock.ticker.upper(); old=data.get(key,{})
     previous=candidate_from(old,stock)
-    if old.get("official") and not previous: raise ValueError("Conflicting cached identity requires explicit repair")
+    if old.get("official") and not previous:
+        # A verified record written by an older domain-resolution
+        # implementation is intentionally not reusable, but it is safe to
+        # replace after the current resolver has independently verified a new
+        # candidate.  Keep the corruption guard for records with no explicit
+        # implementation marker: those may require operator repair because
+        # their provenance cannot be classified deterministically.
+        old_implementation = old.get("domain_resolution_implementation")
+        if old_implementation and old_implementation != DOMAIN_IMPLEMENTATION_VERSION:
+            old = {**old, "invalidated_explicitly": True}
+        else:
+            raise ValueError("Conflicting cached identity requires explicit repair")
     if previous and (previous.officiality_score > candidate.officiality_score or previous.url != candidate.url): return
     now=datetime.now(timezone.utc).isoformat()
     first=old.get("first_verified_at") or old.get("verified_at") or verified_at or (now if source=="discovery" else None)
+    corporate_domain = candidate.corporate_url or ""
+    if corporate_domain:
+        from urllib.parse import urlsplit
+        hostname = urlsplit(corporate_domain).hostname or corporate_domain
+        extracted = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)(hostname)
+        corporate_domain = extracted.top_domain_under_public_suffix or hostname
+    extracted_domain = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)(corporate_domain) if corporate_domain else None
+    inferred_brand = (extracted_domain.domain.replace("-", " ").title() if extracted_domain and extracted_domain.domain else stock.company_name)
     data[key]={**old, "ticker":stock.ticker,"company_name":stock.company_name,"official_ir_url":candidate.url,
         "official_corporate_url":candidate.corporate_url or old.get("official_corporate_url"),
+        "corporate_domain": corporate_domain or old.get("corporate_domain"),
+        "corporate_brand": old.get("corporate_brand") or inferred_brand,
+        "verification_status": "VERIFIED_IR",
+        "domain_resolution_implementation": DOMAIN_IMPLEMENTATION_VERSION,
         "official":True,"invalidated_explicitly":False,"officiality_score":candidate.officiality_score,
         "evidence":list(dict.fromkeys(old.get("evidence",[])+candidate.evidence)),
         "verification_source":old.get("verification_source") or source,

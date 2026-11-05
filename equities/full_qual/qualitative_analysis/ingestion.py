@@ -19,6 +19,77 @@ from .document_store import DocumentStore
 from .extraction_safety import validate_extracted_text
 
 
+# SEC accession numbers begin with the ten-digit registrant CIK. Prefer this
+# filing-level identity over stale manifest directory/provenance labels.
+_SOURCE_ACCESSION_RE = re.compile(r"(?<!\d)(\d{10})-\d{2}-\d{6}(?!\d)")
+_SOURCE_ARCHIVE_CIK_RE = re.compile(r"/Archives/edgar/data/(\d{1,10})/", re.I)
+
+
+def _reconcile_source_identity(metadata: dict[str, Any], canonical_cik: str | None) -> None:
+    """Annotate and gate a normalized source against the canonical issuer."""
+    canonical = str(canonical_cik or "").strip().zfill(10) if canonical_cik else ""
+    if not canonical:
+        return
+    provenance = metadata.get("provenance")
+    provenance_items = provenance if isinstance(provenance, list) else []
+    candidates: list[str] = []
+    urls: list[str] = []
+    for item in provenance_items:
+        if not isinstance(item, dict):
+            continue
+        for key in ("accession_number", "source_url", "url", "wire_provenance_url"):
+            value = item.get(key)
+            if value:
+                urls.append(str(value))
+        value = item.get("issuer_cik") or item.get("cik") or item.get("source_registrant_cik")
+        if value:
+            digits = re.sub(r"\D", "", str(value))
+            if digits:
+                candidates.append(digits.zfill(10))
+    for key in ("accession_number", "source_url", "official_ir_url", "event_url", "artifact_url"):
+        value = metadata.get(key)
+        if value:
+            urls.append(str(value))
+
+    archive_ciks: list[str] = []
+    accession_ciks: list[str] = []
+    for value in urls:
+        archive = _SOURCE_ARCHIVE_CIK_RE.search(value)
+        if archive:
+            archive_ciks.append(archive.group(1).zfill(10))
+        accession = _SOURCE_ACCESSION_RE.search(value)
+        if accession:
+            accession_ciks.append(accession.group(1))
+    # Some SEC filings are submitted by a filing agent: the first ten digits
+    # of the accession then differ from the registrant CIK in the archive path.
+    # When canonical identity is available, matching either evidence source is
+    # sufficient and avoids treating the agent as an affiliate.  A genuine
+    # mismatch remains ineligible.
+    source_cik = ""
+    if canonical in archive_ciks or canonical in accession_ciks or canonical in candidates:
+        source_cik = canonical
+    elif archive_ciks:
+        source_cik = archive_ciks[0]
+    elif accession_ciks:
+        source_cik = accession_ciks[0]
+    if not source_cik and candidates:
+        source_cik = candidates[0]
+    source_cik = source_cik.zfill(10) if source_cik else ""
+    metadata["canonical_registrant_cik"] = canonical
+    metadata["source_registrant_cik"] = source_cik or canonical
+    metadata["source_lineage_relation"] = "CANONICAL_REGISTRANT" if not source_cik or source_cik == canonical else "AFFILIATE"
+    metadata["source_identity_eligible"] = not source_cik or source_cik == canonical
+    for item in provenance_items:
+        if not isinstance(item, dict) or not source_cik:
+            continue
+        old = str(item.get("issuer_cik") or "").strip()
+        if old and old.zfill(10) != source_cik:
+            item.setdefault("raw_issuer_cik", old)
+            item["issuer_cik"] = source_cik
+    if source_cik and source_cik != canonical:
+        raise ValueError("SOURCE_IDENTITY_INCOMPATIBLE")
+
+
 @dataclass
 class IngestionResult:
     ticker: str | None = None
@@ -201,7 +272,7 @@ def _records(manifest: dict[str, Any]) -> Iterable[tuple[str, dict[str, Any]]]:
                     yield kind, value
 
 
-def ingest_company(company_dir: Path, store: DocumentStore | None = None, *, document_type: str | None = None, dry_run: bool = False) -> IngestionResult:
+def ingest_company(company_dir: Path, store: DocumentStore | None = None, *, document_type: str | None = None, dry_run: bool = False, issuer_cik: str | None = None) -> IngestionResult:
     manifest_path = company_dir / "manifest.json"
     manifest = _json(manifest_path)
     ticker = company_dir.name.split("_", 1)[0].upper()
@@ -244,6 +315,7 @@ def ingest_company(company_dir: Path, store: DocumentStore | None = None, *, doc
         text = ""
         artifact_metadata: dict[str, Any] = {}
         try:
+            _reconcile_source_identity(metadata, issuer_cik)
             if local and local.exists():
                 if local.suffix.lower() == ".json":
                     data = _json(local)
@@ -302,7 +374,10 @@ def ingest_company(company_dir: Path, store: DocumentStore | None = None, *, doc
                 result.failures.append(IngestionFailure("NON_SUBSTANTIVE_EXCLUDED", "Image-only agenda attachment has no extractable analytical text", ticker=ticker, title=title, source_url=record.get("source_url") or record.get("event_url"), local_path=str(local) if local else None, document_type=candidate_type, warning=True))
                 continue
             result.documents_failed += 1
-            failure_type = "TEXT_EXTRACTION_FAILED" if local and local.suffix.lower() == ".pdf" else ("EMPTY_TEXT" if "empty" in str(exc).lower() else "UNSUPPORTED_FORMAT")
+            if str(exc) == "SOURCE_IDENTITY_INCOMPATIBLE":
+                failure_type = "SOURCE_IDENTITY_INCOMPATIBLE"
+            else:
+                failure_type = "TEXT_EXTRACTION_FAILED" if local and local.suffix.lower() == ".pdf" else ("EMPTY_TEXT" if "empty" in str(exc).lower() else "UNSUPPORTED_FORMAT")
             result.failures.append(IngestionFailure(failure_type, str(exc), ticker=ticker, title=title, source_url=record.get("source_url") or record.get("event_url"), local_path=str(local) if local else None, document_type=candidate_type))
         except Exception as exc:
             # Parser-specific exceptions (for example pypdf's PdfReadError)
@@ -322,7 +397,7 @@ def ingest_company(company_dir: Path, store: DocumentStore | None = None, *, doc
     return result
 
 
-def ingest(*, ticker: str | None = None, all_companies: bool = False, download_root: str | Path = Path.home() / "Downloads", store: DocumentStore | None = None, rebuild: bool = False, replace_ticker: bool = False, document_type: str | None = None, dry_run: bool = False) -> IngestionResult:
+def ingest(*, ticker: str | None = None, all_companies: bool = False, download_root: str | Path = Path.home() / "Downloads", store: DocumentStore | None = None, rebuild: bool = False, replace_ticker: bool = False, document_type: str | None = None, dry_run: bool = False, issuer_cik: str | None = None) -> IngestionResult:
     root = Path(download_root)
     store = store or DocumentStore()
     if rebuild and not dry_run:
@@ -333,7 +408,7 @@ def ingest(*, ticker: str | None = None, all_companies: bool = False, download_r
     dirs = _iter_company_dirs(root, None if all_companies else ticker)
     result = IngestionResult(ticker=ticker.upper() if ticker else None)
     for company_dir in dirs:
-        result.merge(ingest_company(company_dir, None, document_type=document_type, dry_run=True))
+        result.merge(ingest_company(company_dir, None, document_type=document_type, dry_run=True, issuer_cik=issuer_cik))
     unique: dict[str, NormalizedDocument] = {}
     for document in result.documents:
         unique.setdefault(document.document_id, document)

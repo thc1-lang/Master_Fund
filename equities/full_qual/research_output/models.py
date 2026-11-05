@@ -73,6 +73,8 @@ class CompanyResearchDossier:
     input_fingerprint: str
     evidence_appendix: list[EvidenceRef] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    issuer_cik: str | None = None
+    issuer_identity: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, include_evidence: bool = False) -> dict[str, Any]:
         d = asdict(self)

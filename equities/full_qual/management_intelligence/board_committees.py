@@ -8,6 +8,7 @@ from typing import Iterable
 from html.parser import HTMLParser
 
 from pypdf import PdfReader
+from bs4 import BeautifulSoup
 
 from .board_governance_models import BoardCommittee, GovernanceBoardMembership
 from .governance_sources import CachedGovernanceSource
@@ -118,8 +119,16 @@ def _committee_alias(label: str) -> tuple[str, str] | None:
         return "risk", "Risk Committee"
     if "governance" in normalized or "nominating" in normalized:
         return "nominating_governance", "Governance Committee"
+    if "personnel" in normalized and "compensation" in normalized:
+        return "compensation", "Personnel & Compensation Committee"
     if "compensation" in normalized:
         return "compensation", "Compensation Committee"
+    if "finance" in normalized:
+        return "finance", "Finance Committee"
+    if "technology" in normalized or "cybersecurity" in normalized:
+        return "technology", "Technology Committee"
+    if "safety" in normalized or "security" in normalized:
+        return "risk", "Safety & Security Committee"
     return None
 
 
@@ -270,6 +279,103 @@ def extract_committees(
     member_map = {item.person_id: item for item in memberships}
     text = proxy.text
     result: list[BoardCommittee] = []
+
+    # Flattened proxies commonly retain one ``COMMITTEES:`` line inside each
+    # director biography even when the matrix itself loses all table cells.
+    # Resolve the nearest validated person and preserve only canonical
+    # committee labels from that bounded disclosure.
+    for committee_match in re.finditer(
+        r"\bCOMMITTEES?\s*:\s*(?P<body>[^\n]{3,500})",
+        text,
+        re.IGNORECASE,
+    ):
+        preceding = text[max(0, committee_match.start() - 1800):committee_match.start()]
+        nearest: tuple[int, ManagementPerson] | None = None
+        for person in people_list:
+            matches = list(re.finditer(re.escape(person.full_name), preceding, re.I))
+            if matches and (nearest is None or matches[-1].start() > nearest[0]):
+                nearest = (matches[-1].start(), person)
+        if nearest is None:
+            continue
+        person_id = nearest[1].person_id
+        body = committee_match.group("body")
+        for pattern, canonical_type, canonical_name in (
+            (r"\bAudit(?:\s+Committee)?\b", "audit", "Audit Committee"),
+            (r"\b(?:Personnel\s*&?\s*)?Compensation(?:\s+Committee)?\b", "compensation", "Personnel & Compensation Committee"),
+            (r"\b(?:Corporate\s+)?Governance(?:\s+Committee)?\b|\bNominating\b", "nominating_governance", "Governance Committee"),
+            (r"\bFinance(?:\s+Committee)?\b", "finance", "Finance Committee"),
+            (r"\b(?:Safety\s*&?\s*Security|Risk)(?:\s+Committee)?\b", "risk", "Safety & Security Committee"),
+            (r"\bTechnology(?:\s+Committee)?\b", "technology", "Technology Committee"),
+        ):
+            if not re.search(pattern, body, re.I):
+                continue
+            result.append(BoardCommittee(
+                committee_id=f"governance-committee:{ticker.upper()}:{canonical_type}:{re.sub(r'[^a-z0-9]+', '-', canonical_name.lower()).strip('-')}",
+                ticker=ticker.upper(), committee_type=canonical_type, committee_name=canonical_name,
+                members=[person_id], source_url=proxy.source_url,
+                source_accession=proxy.accession_number, source_form=proxy.form_type,
+                source_date=proxy.filing_date, local_source_path=proxy.local_path,
+                evidence_text=f"SEC proxy director biography committee disclosure: {nearest[1].full_name} | {body}",
+            ))
+
+    # Some definitive SEC proxies publish committee membership in the same
+    # board-roster table as the ``Current Committees`` column rather than in a
+    # separate director-by-committee grid.  Preserve that structured row
+    # relationship before falling back to flattened prose.  The extraction is
+    # deliberately based on the table's semantic headers and validated people,
+    # so arbitrary committee headings can never become person records.
+    if proxy.html:
+        try:
+            soup = BeautifulSoup(proxy.html, "html.parser")
+            for table in soup.find_all("table"):
+                preview = " | ".join(
+                    re.sub(r"\s+", " ", row.get_text(" ", strip=True))
+                    for row in table.find_all("tr", limit=3)
+                    if row.get_text(" ", strip=True).strip()
+                ).lower()
+                if not (
+                    re.search(r"\bname\b", preview)
+                    and re.search(r"\bdirector\b", preview)
+                    and re.search(r"\bsince\b", preview)
+                    and re.search(r"\bcommittee", preview)
+                ):
+                    continue
+                for row in table.find_all("tr"):
+                    nodes = row.find_all(["td", "th"])
+                    nonempty = [node for node in nodes if node.get_text(" ", strip=True).strip()]
+                    if len(nonempty) < 2:
+                        continue
+                    first = nonempty[0]
+                    bold = first.find(["b", "strong"])
+                    name = re.sub(r"\s*\([^)]*\)", "", (bold.get_text(" ", strip=True) if bold else first.get_text(" ", strip=True))).strip(" ,")
+                    ids = _person_ids(name, people_list)
+                    if not ids:
+                        continue
+                    committee_cell = nonempty[-1].get_text(" ", strip=True)
+                    for alias, canonical in (
+                        (r"\bAudit\b", ("audit", "Audit Committee")),
+                        (r"\b(?:Personnel\s*&?\s*)?Compensation\b", ("compensation", "Personnel & Compensation Committee")),
+                        (r"\b(?:Corporate\s+)?Governance\b", ("nominating_governance", "Governance Committee")),
+                        (r"\bNominating\b", ("nominating_governance", "Nominating Committee")),
+                        (r"\bFinance\b", ("finance", "Finance Committee")),
+                        (r"\b(?:Safety\s*&?\s*Security|Risk)\b", ("risk", "Safety & Security Committee")),
+                        (r"\bTechnology\b", ("technology", "Technology Committee")),
+                    ):
+                        if not re.search(alias, committee_cell, re.I):
+                            continue
+                        person_id = ids[0]
+                        result.append(BoardCommittee(
+                            committee_id=f"governance-committee:{ticker.upper()}:{canonical[0]}:{re.sub(r'[^a-z0-9]+', '-', canonical[1].lower()).strip('-')}",
+                            ticker=ticker.upper(), committee_type=canonical[0], committee_name=canonical[1],
+                            members=[person_id], source_url=proxy.source_url,
+                            source_accession=proxy.accession_number, source_form=proxy.form_type,
+                            source_date=proxy.filing_date, local_source_path=proxy.local_path,
+                            evidence_text=f"SEC proxy board roster committee cell: {name} | {committee_cell}",
+                        ))
+        except Exception:
+            # The text parser below remains the safe fallback for malformed
+            # HTML; no source-backed entity is fabricated on parser errors.
+            pass
 
     # When the authoritative normalized source was materialized from a PDF,
     # re-read only the committee page in pypdf's layout mode.  This preserves
@@ -816,6 +922,56 @@ def extract_committees(
                 local_source_path=proxy.local_path,
                 evidence_text=table_text[max(0, heading.start() - 500):min(len(table_text), heading.end() + 1200)],
             ))
+    # Foreign annual reports and AGM results often present committee prose
+    # rather than a U.S. proxy matrix.  Use bounded committee sections and
+    # validated people only; a committee shell is retained when membership is
+    # not explicitly recoverable.
+    if proxy.form_type.upper() not in {"DEF 14A", "DEFA14A"}:
+        foreign_aliases = (
+            ("audit", "Audit and Risk Committee", r"Audit(?: and Risk)? Committee"),
+            ("remuneration", "Remuneration Committee", r"Remuneration Committee|Compensation Committee"),
+            ("nominating_governance", "Nominations and Governance Committee", r"Nominations?(?: and| &) Governance Committee|Nominating(?: and| &) Governance Committee"),
+            ("technology", "Technology Committee", r"Technology Committee"),
+            ("esg", "ESG Committee", r"ESG Committee"),
+        )
+        foreign_records: dict[str, BoardCommittee] = {}
+        heading_re = re.compile(r"(?P<label>Audit(?: and Risk)? Committee|Remuneration Committee|Compensation Committee|Nominations?(?: and| &) Governance Committee|Nominating(?: and| &) Governance Committee|Technology Committee|ESG Committee)", re.I)
+        matches = list(heading_re.finditer(text))
+        for match in matches:
+            label = match.group("label")
+            alias = next((item for item in foreign_aliases if re.fullmatch(item[2], label, re.I)), None)
+            if alias is None:
+                alias = next((item for item in foreign_aliases if re.search(item[2], label, re.I)), None)
+            if alias is None:
+                continue
+            fragment = text[match.end(): min(len(text), match.end() + 900)]
+            next_heading = heading_re.search(fragment)
+            if next_heading:
+                fragment = fragment[:next_heading.start()]
+            ids = _person_ids(fragment, people_list)
+            # ``Chair: Name`` and ``Name (Chair)`` are explicit leadership
+            # evidence; no chair is inferred from ordering.
+            chair_id = None
+            chair_match = re.search(r"(?:Chair|Chairman|Chairperson)\s*:\s*([A-Z][A-Za-zÀ-ÿ.'’ -]+)", fragment, re.I)
+            if chair_match:
+                found = _person_ids(chair_match.group(1), people_list)
+                chair_id = found[0] if found else None
+            committee_id = f"governance-committee:{ticker.upper()}:{alias[0]}"
+            item = foreign_records.get(committee_id)
+            if item is None:
+                item = BoardCommittee(
+                    committee_id=committee_id, ticker=ticker.upper(), committee_type=alias[0], committee_name=alias[1],
+                    members=[], source_url=proxy.source_url, source_accession=proxy.accession_number,
+                    source_form=proxy.form_type, source_date=proxy.filing_date, local_source_path=proxy.local_path,
+                    evidence_text=f"Foreign issuer committee disclosure: {label} {fragment[:1200]}",
+                )
+                foreign_records[committee_id] = item
+            item.members = sorted(set(item.members + ids))
+            if chair_id:
+                item.chair_person_id = chair_id
+        if foreign_records:
+            chosen.extend(foreign_records.values())
+
     # An explicitly visible matrix with no accepted rows is a parser failure;
     # a named committee without a membership disclosure is a source limitation.
     matrix_visible = bool(html_matrix_rows) or bool(re.search(r"current\s+(?:board\s+)?committee\s+membership", table_source, re.I))

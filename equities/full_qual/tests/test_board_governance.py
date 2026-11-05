@@ -214,8 +214,8 @@ class BoardGovernanceTests(unittest.TestCase):
 
     def test_governance_versions_are_explicit(self):
         record = GovernanceBoardMembership("g", "p1", "TST")
-        self.assertEqual(record.governance_version, "board-governance-v1")
-        self.assertEqual(record.independence_version, "board-independence-v1")
+        self.assertEqual(record.governance_version, "board-governance-v2")
+        self.assertEqual(record.independence_version, "board-independence-v2")
 
     def test_related_party_positive_record_requires_named_person(self):
         people = [_person("p1", "Alice Director")]

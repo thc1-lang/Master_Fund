@@ -39,7 +39,10 @@ SOURCE_STATIC = "OFFICIAL_STATIC_DOCUMENT"
 SOURCE_SEC = "SEC_EDGAR"
 SOURCE_EVENTS = "OFFICIAL_IR_EVENTS"
 
-SEC_FORMS = ("10-K", "10-Q", "8-K", "DEF 14A")
+# Include the principal foreign-issuer periodic/current-report forms as well
+# as the US issuer forms.  The SEC submissions endpoint is issuer-neutral;
+# filtering here must not silently drop a foreign issuer's 20-F/6-K history.
+SEC_FORMS = ("10-K", "10-Q", "8-K", "DEF 14A", "20-F", "6-K")
 SEC_USER_AGENT = "Allen & Cooper Insider Intelligence nicholaslallen1@gmail.com"
 
 
@@ -205,8 +208,8 @@ class OfficialSourceStrategy:
         inherited = bool(primary_host and host == primary_host)
         return score >= 90 or inherited, evidence + (["Verified primary IR host"] if inherited else []), title, text
 
-    @staticmethod
     def _doc(
+        self,
         *,
         link: Link,
         category: str,
@@ -231,12 +234,24 @@ class OfficialSourceStrategy:
             discovered_from=page_url,
             artifact_url=source_url,
             issuer_verified=True,
+            canonical_registrant_cik=self.issuer_cik,
+            canonical_registrant_name=self.stock.company_name,
+            source_registrant_cik=self.issuer_cik if family == SOURCE_SEC else None,
+            source_registrant_name=self.stock.company_name if family == SOURCE_SEC else None,
+            source_lineage_relation="CANONICAL_REGISTRANT" if self.issuer_cik else "UNKNOWN",
+            source_identity_eligible=True,
             provenance=[
                 {
                     "source_family": family,
                     "discovered_from": page_url,
                     "artifact_url": source_url,
                     "issuer_verified": "true",
+                    "canonical_registrant_cik": self.issuer_cik or "",
+                    "canonical_registrant_name": self.stock.company_name,
+                    "source_registrant_cik": self.issuer_cik or "" if family == SOURCE_SEC else "",
+                    "source_registrant_name": self.stock.company_name if family == SOURCE_SEC else "",
+                    "source_lineage_relation": "CANONICAL_REGISTRANT" if self.issuer_cik else "UNKNOWN",
+                    "source_identity_eligible": "true",
                 }
             ],
         )
@@ -275,14 +290,14 @@ class OfficialSourceStrategy:
                     continue
                 docs.append(self._doc(link=link, category="reports", family=route.family, page_url=url, company=self.stock))
                 docs[-1].discovery_method = "official_ir_financial_results"
-                docs[-1].provenance.append({"source_family": route.family, "discovered_from": url, "artifact_url": link.url, "artifact_type": "financial_result_artifact", "issuer_verified": "true"})
+                docs[-1].provenance.append({"source_family": route.family, "discovered_from": url, "artifact_url": link.url, "artifact_type": "financial_result_artifact", "issuer_verified": "true", "canonical_registrant_cik": self.issuer_cik or "", "canonical_registrant_name": self.stock.company_name, "source_lineage_relation": "UNKNOWN", "source_identity_eligible": "true"})
             for document in docs:
                 document.source_family = SOURCE_STATIC if urlsplit(document.source_url).hostname != urlsplit(url).hostname else route.family
                 document.discovered_from = url
                 document.artifact_url = document.source_url
                 document.issuer_verified = True
                 document.discovery_method = "official_static_document" if document.source_family == SOURCE_STATIC else "official_ir_financial_results"
-                document.provenance.append({"source_family": route.family, "discovered_from": url, "artifact_url": document.source_url, "issuer_verified": "true"})
+                document.provenance.append({"source_family": route.family, "discovered_from": url, "artifact_url": document.source_url, "issuer_verified": "true", "canonical_registrant_cik": self.issuer_cik or "", "canonical_registrant_name": self.stock.company_name, "source_lineage_relation": "UNKNOWN", "source_identity_eligible": "true"})
         for link in links:
             text = (link.text + " " + link.context).lower()
             if is_pdf(link) or "/static-files/" in link.url:
@@ -402,12 +417,17 @@ class OfficialSourceStrategy:
         # driver.  Avoid an accidental live SEC request in offline tests.
         if not getattr(self.browser, "driver", None):
             raise RuntimeError("SEC transport unavailable")
-        cache = self.cache_root / ".official_sources" / self.stock.ticker.upper() / ("company_tickers.json" if "company_tickers" in url else "submissions.json")
+        submission_match = re.search(r"CIK(\d{10})", url, re.I)
+        cache_name = f"submissions_{submission_match.group(1)}.json" if submission_match else ("company_tickers.json" if "company_tickers" in url else "submissions.json")
+        cache = self.cache_root / ".official_sources" / self.stock.ticker.upper() / cache_name
         if cache.exists() and not getattr(self.browser.config, "revalidate_ir", False):
             try:
                 value = json.loads(cache.read_text(encoding="utf-8"))
                 if isinstance(value, dict):
-                    return value
+                    if submission_match and str(value.get("cik") or "").replace(" ", "").zfill(10) != submission_match.group(1):
+                        value = None
+                    if value is not None:
+                        return value
             except (OSError, ValueError, TypeError):
                 pass
 
@@ -453,7 +473,10 @@ class OfficialSourceStrategy:
                 archive = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/{primary or accession + '.txt'}"
                 link = Link(archive, f"{form} {report_date or filing_date}", f"SEC filing {form} filed {filing_date}")
                 doc = self._doc(link=link, category="reports", family=SOURCE_SEC, page_url=submissions_url, company=self.stock, title=f"{self.stock.ticker} {form} {report_date or filing_date}", date=filing_date)
-                doc.provenance[0].update({"issuer_cik": cik, "accession_number": accession, "form_type": form, "filing_date": str(filing_date or ""), "source_url": archive})
+                doc.source_registrant_cik = cik
+                doc.source_registrant_name = self.stock.company_name
+                doc.source_lineage_relation = "CANONICAL_REGISTRANT" if cik == self.issuer_cik else "UNKNOWN"
+                doc.provenance[0].update({"issuer_cik": cik, "accession_number": accession, "form_type": form, "filing_date": str(filing_date or ""), "source_url": archive, "source_registrant_cik": cik, "source_registrant_name": self.stock.company_name, "source_lineage_relation": doc.source_lineage_relation, "source_identity_eligible": "true" if doc.source_lineage_relation == "CANONICAL_REGISTRANT" else "false"})
                 docs.append(doc)
                 # Keep the live fallback bounded; the separate insider
                 # component owns the complete Form 3/4/5 history.
@@ -467,15 +490,36 @@ class OfficialSourceStrategy:
             self.statuses[SOURCE_SEC] = "ACCESS_BLOCKED" if "403" in str(exc) or "forbidden" in str(exc).lower() else "UNUSABLE"
             self.observations.append(RouteObservation(OfficialRoute("https://data.sec.gov/submissions/", SOURCE_SEC, None, True), self.statuses[SOURCE_SEC], None, [], str(exc)))
 
-    async def discover(self) -> dict:
+    async def discover(self, *, critical_only: bool = False) -> dict:
         routes = self.routes()
         max_routes = max(1, int(getattr(self.browser.config, "max_official_routes", 24)))
+        # SEC filings are the fastest authoritative financial fallback for an
+        # issuer with a resolved CIK.  Discover them before probing slow IR
+        # archive routes so a bounded run cannot spend its entire budget on
+        # newsroom navigation.  The route families remain deterministic.
+        sec_attempted = False
+        if getattr(self.browser, "driver", None) or self.sec_fetcher is not None or self.issuer_cik:
+            await self.discover_sec()
+            sec_attempted = True
+        # Preserve the route builder's deterministic per-origin ordering.
+        # Critical-only discovery is used by the orchestrator as the bounded
+        # Tier 1 pass: SEC filings are returned immediately, before any slow
+        # IR/newsroom route can consume the financial download budget.  The
+        # normal public API retains the complete route-probing behavior.
         routes = routes[:max_routes]
-        # Keep route probing sequential and bounded, matching the rest of the
-        # acquisition layer's politeness and retry model.
-        for route in routes:
-            await self._observe_route(route)
-        await self.discover_sec()
+        if not critical_only:
+            # Keep route probing sequential and bounded, matching the rest of
+            # the acquisition layer's politeness and retry model.
+            for route in routes:
+                await self._observe_route(route)
+        # Offline/unit-test browsers must never fall through to live SEC
+        # discovery.  The SEC fallback is still used for real browser-backed
+        # runs and injected deterministic fetchers, but a fixture with no
+        # driver has no transport obligation and should complete immediately.
+        if not sec_attempted and (getattr(self.browser, "driver", None) or self.sec_fetcher is not None or self.issuer_cik):
+            await self.discover_sec()
+        else:
+            self.statuses[SOURCE_SEC] = "UNUSABLE"
         for observation in self.observations:
             self.statuses.setdefault(observation.route.family, observation.status)
             if observation.status == "SUCCESS":

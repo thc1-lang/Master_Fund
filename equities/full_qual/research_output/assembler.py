@@ -7,6 +7,7 @@ from typing import Any
 
 from .evidence_links import ArtifactReader, SourceCatalog, record_id
 from .models import CompanyResearchDossier, ReportFact
+from pipeline_runner.issuer_resolution import canonical_identity_hash
 
 REPORT_VERSION = "research-output-v1"
 
@@ -21,7 +22,11 @@ def _ticker_match(row: dict[str,Any], ticker: str) -> bool:
     t=ticker.upper(); vals=[]
     for k in ("ticker","issuer_ticker","board_ticker","employer_ticker","target_ticker"):
         if row.get(k): vals.append(str(row[k]).upper())
-    if t in vals: return True
+    # An explicit issuer field is authoritative.  Never fall back to a
+    # substring search in URLs/company text when it names a different ticker;
+    # short ticker strings can occur naturally in unrelated words (e.g.
+    # ``catalyst``) and previously admitted another issuer's first row.
+    if vals: return t in vals
     text=" ".join(str(row.get(k,"")) for k in ("company_name","board_company","employer","local_path","local_source_path","source_local_path","source_url"))
     n=_norm(text)
     return t.lower() in n or (row.get("issuer_ticker") or "").upper() == t
@@ -62,7 +67,18 @@ class Builder:
         self.claims=self.rows("qualitative_analysis","claims.jsonl")
         self.documents=self.rows("qualitative_analysis","documents.jsonl")
         self._doc_by_id={r.get("document_id"):r for r in self.documents}
-        self.company_name=self._infer_company_name()
+        self.issuer_identity = self._load_issuer_identity()
+        self.company_name=self.issuer_identity.get("legal_name") or self._infer_company_name()
+        self.issuer_cik = self.issuer_identity.get("issuer_cik") or self._infer_issuer_cik()
+        self.issuer_identity.setdefault("requested_ticker", self.ticker)
+        self.issuer_identity.setdefault("resolved_ticker", self.ticker)
+        self.issuer_identity.setdefault("legal_name", self.company_name)
+        self.issuer_identity.setdefault("normalized_legal_name", re.sub(r"[^a-z0-9]+", " ", self.company_name.casefold()).strip())
+        self.issuer_identity.setdefault("issuer_cik", self.issuer_cik)
+        self.issuer_identity.setdefault("identity_version", self.issuer_identity.get("lineage_version") or "issuer-lineage-v1")
+        self.issuer_identity.setdefault("identity_confidence", "HIGH" if self.issuer_cik else "MEDIUM")
+        self.issuer_identity.setdefault("source_of_identity", "normalized_sec_document" if self.issuer_cik else "normalized_document")
+        self.issuer_identity.setdefault("identity_hash", canonical_identity_hash(ticker=self.ticker, exchange=self.issuer_identity.get("exchange"), cik=self.issuer_cik, legal_name=self.issuer_identity.get("legal_name"), lineage_version=self.issuer_identity.get("lineage_version") or self.issuer_identity.get("identity_version") or "issuer-lineage-v1"))
     def rows(self, subdir: str, file: str) -> list[dict[str, Any]]:
         return [row for row in _rows(self.reader, subdir, file, self.ticker) if _available_by_cutoff(row, self.as_of)]
     def configured_profile_version(self) -> str:
@@ -75,11 +91,31 @@ class Builder:
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return self.profile
     def _infer_company_name(self) -> str:
-        for row in self.documents + self.claims + self.qstates:
-            name = row.get("company_name") or row.get("issuer_name")
-            if name:
-                return str(name)
+        names = [str(row.get("company_name") or row.get("issuer_name") or "").strip() for row in self.documents + self.claims + self.qstates]
+        names = [name for name in names if name]
+        if names:
+            # Majority vote across the ticker-filtered store prevents stale
+            # append-only rows from winning merely because they appear first.
+            return max(sorted(set(names)), key=lambda name: (names.count(name), len(name)), default=self.ticker)
         return self.ticker
+
+    def _infer_issuer_cik(self) -> str | None:
+        for row in self.documents + self.claims:
+            value = row.get("issuer_cik") or row.get("cik") or row.get("issuer_cik_number")
+            if value:
+                return str(value).zfill(10)
+            match = re.search(r"/data/(\d{6,12})/", str(row.get("source_url") or ""))
+            if match:
+                return match.group(1).zfill(10)
+        return None
+
+    def _load_issuer_identity(self) -> dict[str, Any]:
+        path = Path(self.reader.root) / "issuer_identity" / f"{self.ticker}.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        return dict(value) if isinstance(value, dict) and str(value.get("resolved_ticker") or value.get("ticker") or self.ticker).upper() == self.ticker else {}
     def cite(self,row:dict[str,Any],typ:str, snippet:str="") -> list[int]:
         if not (row.get("source_url") or row.get("source_urls") or row.get("url")):
             related=(row.get("supporting_claim_ids") or row.get("to_claim_ids") or row.get("from_claim_ids") or row.get("source_claim_ids") or [])
@@ -148,12 +184,33 @@ class Builder:
     def build_governance(self)->dict[str,Any]:
         root="management_intelligence"; snap=_latest(self.rows(root,"governance_snapshots.jsonl"))
         if not snap:return {"status":"Not established from available official-source coverage.","available":False}
-        committees=self.rows(root,"governance_committees.jsonl"); rights=_latest(self.rows(root,"governance_shareholder_rights.jsonl")); voting=_latest(self.rows(root,"governance_voting_control.jsonl")); expertise=self.rows(root,"governance_expertise.jsonl")
+        coverage=_latest(self.rows(root,"governance_coverage.jsonl")); committees=self.rows(root,"governance_committees.jsonl"); rights=_latest(self.rows(root,"governance_shareholder_rights.jsonl")); voting=_latest(self.rows(root,"governance_voting_control.jsonl")); expertise=self.rows(root,"governance_expertise.jsonl")
         snap_src=self.cite(snap,"governance_snapshot");
         for r in committees: self.cite(r,"governance_committee")
         rights_src=self.cite(rights,"shareholder_rights") if rights else []
         voting_src=self.cite(voting,"voting_control") if voting else []
-        return {"available":True,"source_record_ids":[record_id(snap,"")],"source_numbers":snap_src,"board_size":snap.get("board_size"),"independence":{"known_count":snap.get("known_independence_count"),"known_denominator":snap.get("known_independence_denominator"),"percentage":snap.get("known_status_independent_percentage"),"unknown":snap.get("unknown_independence")},"chair_structure":snap.get("chair_structure"),"chair_is_independent":snap.get("chair_is_independent"),"lead_independent_director":snap.get("lead_independent_director"),"committees":[{"name":c.get("committee_name"),"required_independence":c.get("required_independence"),"financial_experts":len(c.get("financial_expert_person_ids") or []),"member_independence":c.get("member_independence"),"source_record_ids":[record_id(c,"")],"source_numbers":self.cite(c,"governance_committee")} for c in committees],"expertise_records":len(expertise),"tenure":{"average":snap.get("average_tenure"),"median":snap.get("median_tenure")},"voting":dict(voting,source_record_ids=[record_id(voting,"")],source_numbers=voting_src) if voting else {"status":"Not established from available official-source coverage."},"shareholder_rights":dict(rights,source_record_ids=[record_id(rights,"")],source_numbers=rights_src) if rights else {"status":"Not established from available official-source coverage."}}
+        committee_view = []
+        for c in committees:
+            committee_view.append({
+                "name": c.get("committee_name"),
+                "committee_type": c.get("committee_type"),
+                "members": list(c.get("members") or []),
+                "member_count": len(c.get("members") or []),
+                "required_independence": c.get("required_independence"),
+                "financial_experts": len(c.get("financial_expert_person_ids") or []),
+                "member_independence": c.get("member_independence"),
+                "membership_status": c.get("membership_status") or "UNKNOWN",
+                "source_status": c.get("source_status") or "UNKNOWN",
+                "source_accession": c.get("source_accession"),
+                "source_date": c.get("source_date"),
+                "source_filed_at": c.get("source_filed_at"),
+                "source_period": c.get("source_period"),
+                "as_of_eligibility": c.get("as_of_eligibility") or "ELIGIBLE",
+                "normalized_document_id": c.get("normalized_document_id"),
+                "source_record_ids": [record_id(c, "")],
+                "source_numbers": self.cite(c, "governance_committee"),
+            })
+        return {"available":True,"source_record_ids":[record_id(snap,"")],"source_numbers":snap_src,"board_size":snap.get("board_size") or coverage.get("board_size"),"independence":{"known_count":snap.get("known_independence_count"),"known_denominator":snap.get("known_independence_denominator"),"percentage":snap.get("known_status_independent_percentage"),"unknown":snap.get("unknown_independence")},"chair_structure":snap.get("chair_structure"),"chair_is_independent":snap.get("chair_is_independent"),"lead_independent_director":snap.get("lead_independent_director"),"governance_status":("GOVERNANCE_COMPLETE" if coverage.get("board_composition") == "COMPLETE" and float(coverage.get("governance_completeness_score") or 0) >= 70 else ("GOVERNANCE_PARTIAL" if coverage.get("board_composition") == "COMPLETE" else "GOVERNANCE_INSUFFICIENT")),"governance_completeness_score":coverage.get("governance_completeness_score") or snap.get("governance_completeness_score"),"committees":committee_view,"expertise_records":len(expertise),"tenure":{"average":snap.get("average_tenure"),"median":snap.get("median_tenure")},"voting":dict(voting,source_record_ids=[record_id(voting,"")],source_numbers=voting_src) if voting else {"status":"Not established from available official-source coverage."},"shareholder_rights":dict(rights,source_record_ids=[record_id(rights,"")],source_numbers=rights_src) if rights else {"status":"Not established from available official-source coverage."}}
     def build_scoring(self)->dict[str,Any]:
         rows=[r for r in self.rows("scoring_engine","company_scores.jsonl") if str(r.get("profile") or self.profile) == self.profile]
         snap=_latest(rows) or {}; profile_version=snap.get("profile_version") or self.configured_profile_version()
@@ -198,7 +255,7 @@ class Builder:
         if bq["facts"]: summary.append(ReportFact("The dossier contains evidence-backed business states; these remain distinct from absolute quality scores.","executive_summary",[f["evidence_ids"][0] for f in bq["facts"][:3]],[f["source_numbers"][0] for f in bq["facts"][:3] if f["source_numbers"]]))
         if traj["facts"]: summary.append(ReportFact("The stored trajectory evidence is summarized by directional trends in the Business Trajectory section.","executive_summary",[f["evidence_ids"][0] for f in traj["facts"][:3]],[f["source_numbers"][0] for f in traj["facts"][:3] if f["source_numbers"]]))
         summary.append(ReportFact(f"Overall score: {'Not issued' if scoring.get('overall_score') is None else scoring.get('overall_score')}; status: {scoring.get('status') or 'unknown'}.","executive_summary",list(scoring.get("source_record_ids",[])),list(scoring.get("source_numbers",[]))))
-        fp_payload={"ticker":self.ticker,"as_of":self.as_of,"qstates":self.qstates,"changes":self.changes,"claims":self.claims,"documents":[{k:v for k,v in x.items() if k not in ('text','sections')} for x in self.documents],"management":management,"insiders":insiders,"governance":governance,"scoring":scoring}
+        fp_payload={"ticker":self.ticker,"as_of":self.as_of,"issuer_identity":self.issuer_identity,"qstates":self.qstates,"changes":self.changes,"claims":self.claims,"documents":[{k:v for k,v in x.items() if k not in ('text','sections')} for x in self.documents],"management":management,"insiders":insiders,"governance":governance,"scoring":scoring}
         fingerprint=hashlib.sha256(json.dumps(fp_payload,sort_keys=True,default=str,separators=(",",":" )).encode()).hexdigest()
         refs=self.catalog.finalize()
         # source numbers in facts were assigned before finalization; remap from record ids
@@ -221,7 +278,8 @@ class Builder:
                 f["source_numbers"]= [self.catalog.number_for(x) for x in f["evidence_ids"] if self.catalog.number_for(x)]
         management=remap_obj(management); insiders=remap_obj(insiders); governance=remap_obj(governance); scoring=remap_obj(scoring)
         dossier_id=f"dossier:{self.ticker}:{self.as_of}:{REPORT_VERSION}:{scoring.get('profile_version','core-v1.2')}:{fingerprint[:16]}"
-        return CompanyResearchDossier(dossier_id,self.ticker,self.company_name,self.as_of,self.as_of,[remap(f) for f in summary],bq,traj,management,insiders,governance,scoring,[remap(f) for f in positive],[remap(f) for f in negative],{"current":[remap(f) for f in riskfacts],"emerging":[remap(f) for f in emerging]},[remap(f) for f in catalysts],sorted(set(gaps)),refs,self.as_of+"T00:00:00+00:00",REPORT_VERSION,scoring.get("profile_version","core-v1.2"),scoring.get("scoring_version","qualitative-scoring-v1.2"),scoring.get("coverage_version","coverage-v3"),fingerprint,refs,{"documents":len(self.documents),"claims":len(self.claims),"states":len(self.qstates),"temporal_changes":len(self.changes)})
+        metadata = {"documents":len(self.documents),"claims":len(self.claims),"states":len(self.qstates),"temporal_changes":len(self.changes),"issuer_identity": dict(self.issuer_identity),"issuer_cik": self.issuer_cik}
+        return CompanyResearchDossier(dossier_id,self.ticker,self.company_name,self.as_of,self.as_of,[remap(f) for f in summary],bq,traj,management,insiders,governance,scoring,[remap(f) for f in positive],[remap(f) for f in negative],{"current":[remap(f) for f in riskfacts],"emerging":[remap(f) for f in emerging]},[remap(f) for f in catalysts],sorted(set(gaps)),refs,self.as_of+"T00:00:00+00:00",REPORT_VERSION,scoring.get("profile_version","core-v1.2"),scoring.get("scoring_version","qualitative-scoring-v1.2"),scoring.get("coverage_version","coverage-v3"),fingerprint,refs,metadata, self.issuer_cik, dict(self.issuer_identity))
 
 def assemble_dossier(ticker: str, as_of_date: str, profile: str="core_v1", artifacts_root: str|Path="artifacts") -> CompanyResearchDossier:
     return Builder(ticker,as_of_date,profile,artifacts_root).build()

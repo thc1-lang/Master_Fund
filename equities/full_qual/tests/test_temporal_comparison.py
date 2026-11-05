@@ -13,6 +13,7 @@ from qualitative_analysis.temporal_comparison import (
     period_groups,
     _available_period_labels,
     stable_change_id,
+    eligible_observed_claims,
 )
 from qualitative_analysis.temporal_rules import classify_matched, extract_metric
 from qualitative_analysis.temporal_store import TemporalStore
@@ -67,6 +68,80 @@ def _claim(
 
 
 class TemporalComparisonTests(unittest.TestCase):
+    def test_pit_excludes_future_period_end_from_latest_quarter(self):
+        q1 = _claim("q1", period="Q1 2026", year=2026, quarter=1)
+        q1.period_end_date, q1.available_date = "2026-03-31", "2026-05-01"
+        q2 = _claim("q2", period="Q2 2026", year=2026, quarter=2)
+        q2.period_end_date, q2.available_date = "2026-06-30", "2026-08-03"
+        q4 = _claim("q4", period="Q4 2026", year=2026, quarter=4)
+        q4.period_end_date, q4.available_date = "2026-12-31", "2026-08-01"
+        result = compare_latest_vs_previous("ZM", [q1, q2, q4], horizon="quarterly", as_of_date="2026-09-25")
+        self.assertEqual((result.from_period, result.to_period), ("Q1 2026", "Q2 2026"))
+        self.assertEqual(result.available_periods, ["Q1 2026", "Q2 2026"])
+        self.assertIn("Q4 2026", result.period_diagnostics["future_periods_excluded"])
+        self.assertTrue(any(item["diagnostic"] == "FUTURE_PERIOD_CANDIDATES" for item in result.excluded_periods))
+
+    def test_future_document_is_not_a_period_candidate(self):
+        q1 = _claim("q1", period="Q1 2026", year=2026, quarter=1)
+        q1.period_end_date, q1.available_date = "2026-03-31", "2026-05-01"
+        q2 = _claim("q2", period="Q2 2026", year=2026, quarter=2)
+        q2.period_end_date, q2.available_date = "2026-06-30", "2026-08-03"
+        future_doc = _claim("future-doc", period="Q3 2026", year=2026, quarter=3)
+        future_doc.period_end_date, future_doc.available_date = "2026-09-30", "2026-10-15"
+        result = compare_latest_vs_previous("ZM", [q1, q2, future_doc], horizon="quarterly", as_of_date="2026-09-25")
+        self.assertEqual(result.to_period, "Q2 2026")
+        self.assertIn("Q3 2026", result.period_diagnostics["future_period_candidates"])
+
+    def test_forward_reference_is_excluded_from_observed_chronology_but_retained(self):
+        q1 = _claim("q1", period="Q1 2026", year=2026, quarter=1)
+        q1.period_end_date, q1.available_date = "2026-03-31", "2026-05-01"
+        q2 = _claim("q2", period="Q2 2026", year=2026, quarter=2)
+        q2.period_end_date, q2.available_date = "2026-06-30", "2026-08-03"
+        reference = _claim("reference", period="Q4 2026", year=2026, quarter=4, text="We expect Q4 2026 output to improve.", certainty="guidance")
+        reference.period_end_date, reference.available_date = "2026-12-31", "2026-08-01"
+        reference.temporal_status = "FUTURE"
+        retained, diagnostics = eligible_observed_claims([q1, q2, reference], as_of_date="2026-09-25")
+        self.assertIn("reference", {claim.claim_id for claim in [reference]})
+        self.assertNotIn("reference", {claim.claim_id for claim in retained})
+        self.assertIn("Q4 2026", diagnostics["forward_looking_periods"])
+        result = compare_latest_vs_previous("ZM", [q1, q2, reference], horizon="quarterly", as_of_date="2026-09-25")
+        self.assertEqual((result.from_period, result.to_period), ("Q1 2026", "Q2 2026"))
+
+    def test_unknown_period_end_is_conservatively_excluded(self):
+        q1 = _claim("q1", period="Q1 2026", year=2026, quarter=1)
+        q1.period_end_date, q1.available_date = "2026-03-31", "2026-05-01"
+        q2 = _claim("q2", period="Q2 2026", year=2026, quarter=2)
+        q2.period_end_date, q2.available_date = "2026-06-30", "2026-08-03"
+        unknown = _claim("unknown-q4", period="Q4 2026", year=2026, quarter=4)
+        unknown.available_date = "2026-08-01"
+        unknown.issuer_fiscal_calendar = {"calendar_type": "non_calendar", "fiscal_year_end_month": 6}
+        result = compare_latest_vs_previous("ZM", [q1, q2, unknown], horizon="quarterly", as_of_date="2026-09-25")
+        self.assertEqual(result.to_period, "Q2 2026")
+        self.assertIn("Q4 FY2026", result.period_diagnostics["unknown_period_end"])
+
+    def test_calendar_can_resolve_missing_end_before_cutoff(self):
+        q1 = _claim("q1", period="Q1 2026", year=2026, quarter=1)
+        q1.available_date = "2026-05-01"
+        q1.issuer_fiscal_calendar = {"calendar_type": "calendar", "fiscal_year_end_month": 12}
+        q2 = _claim("q2", period="Q2 2026", year=2026, quarter=2)
+        q2.available_date = "2026-08-03"
+        q2.issuer_fiscal_calendar = {"calendar_type": "calendar", "fiscal_year_end_month": 12}
+        result = compare_latest_vs_previous("ZM", [q1, q2], horizon="quarterly", as_of_date="2026-09-25")
+        self.assertEqual((result.from_period, result.to_period), ("Q1 2026", "Q2 2026"))
+
+    def test_duplicate_period_representations_do_not_create_extra_chronology(self):
+        q1_dated = _claim("q1-dated", period="Q1 2026", year=2026, quarter=1)
+        q1_dated.period_end_date, q1_dated.available_date = "2026-03-31", "2026-05-01"
+        q1_unknown = _claim("q1-unknown", period="Q1 FY2026", year=2026, quarter=1)
+        q1_unknown.available_date = "2026-05-01"
+        q1_unknown.issuer_fiscal_calendar = {"calendar_type": "calendar", "fiscal_year_end_month": 12}
+        q2 = _claim("q2", period="Q2 2026", year=2026, quarter=2)
+        q2.period_end_date, q2.available_date = "2026-06-30", "2026-08-03"
+        q2.issuer_fiscal_calendar = {"calendar_type": "calendar", "fiscal_year_end_month": 12}
+        result = compare_latest_vs_previous("ZM", [q1_dated, q1_unknown, q2], horizon="quarterly", as_of_date="2026-09-25")
+        self.assertEqual(result.available_periods, ["Q1 2026", "Q2 2026"])
+        self.assertGreaterEqual(result.period_diagnostics["duplicate_canonicalized"], 1)
+
     def test_known_future_availability_is_excluded_without_assuming_unknown_dates(self):
         future = _claim("future")
         future.available_date = "2026-09-26"
@@ -247,7 +322,7 @@ class TemporalComparisonTests(unittest.TestCase):
         result = DeterministicTemporalComparisonProvider().compare([previous], [current], "Q1 2027", "Q2 2027")
         change = result.changes[0]
         self.assertTrue(change.from_evidence and change.to_evidence)
-        self.assertEqual(change.comparison_version, "temporal-comparison-v2")
+        self.assertEqual(change.comparison_version, "temporal-comparison-v3")
         self.assertEqual(change.rules_version, "temporal-rules-v2")
         self.assertEqual(change.change_id, stable_change_id("ZM", change.normalized_subject or "", "Q1 2027", "Q2 2027", ["before"], ["after"]))
         with tempfile.TemporaryDirectory() as temp:

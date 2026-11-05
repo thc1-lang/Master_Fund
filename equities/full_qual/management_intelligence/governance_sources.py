@@ -21,6 +21,7 @@ from qualitative_analysis.extraction_safety import safe_text
 from .models import OfficialSource
 from .normalized_sources import NormalizedSECSourceCatalog
 from .store import ManagementStore
+from .source_roles import source_role
 
 
 class _TextParser(HTMLParser):
@@ -62,10 +63,16 @@ class CachedGovernanceSource:
     # retained HTML.  Committee matrices commonly encode ordinary membership
     # with an image marker that disappears from flattened text/PDF extraction.
     html: str | None = None
+    source_role: str | None = None
 
     @property
     def is_proxy(self) -> bool:
         return self.form_type.upper() == "DEF 14A"
+
+    @property
+    def roles(self) -> frozenset[str]:
+        from .source_roles import source_roles
+        return source_roles(form_type=self.form_type, title=self.accession_number, text=self.text)
 
     def to_source(self) -> OfficialSource:
         return OfficialSource(
@@ -77,6 +84,7 @@ class CachedGovernanceSource:
             accession_number=self.accession_number,
             filing_date=self.filing_date,
             report_date=self.report_date,
+            source_role=self.source_role or source_role(form_type=self.form_type, text=self.text),
         )
 
 
@@ -138,7 +146,7 @@ class GovernanceSourceCatalog:
                 except (OSError, ValueError):
                     metadata = {}
             form = str(metadata.get("form_type") or metadata.get("form") or "").upper()
-            if form not in {"DEF 14A", "8-K", "10-K", "8-K/A"}:
+            if form not in {"DEF 14A", "8-K", "10-K", "20-F", "10-Q", "6-K", "8-K/A"}:
                 # A source registry entry may still identify a cached proxy.
                 form = ""
             for path in sorted(filing_dir.iterdir()):
@@ -154,14 +162,15 @@ class GovernanceSourceCatalog:
                 accession = filing_dir.name
                 cik = str(metadata.get("issuer_cik") or metadata.get("cik") or "")
                 url = str(metadata.get("source_url") or self._url_for(ticker, accession, path.name, cik))
-                result.append(CachedGovernanceSource(ticker.upper(), accession, form or str(metadata.get("form_type") or "UNKNOWN"), metadata.get("filing_date"), metadata.get("report_date"), url, str(path), text, extraction_status=extraction_status, extraction_error=None if extraction_status == "VERIFIED" else "RAW_OR_BINARY_SOURCE", html=raw if path.suffix.lower() in {".htm", ".html"} else None))
+                actual_form = form or str(metadata.get("form_type") or "UNKNOWN")
+                result.append(CachedGovernanceSource(ticker.upper(), accession, actual_form, metadata.get("filing_date"), metadata.get("report_date"), url, str(path), text, extraction_status=extraction_status, extraction_error=None if extraction_status == "VERIFIED" else "RAW_OR_BINARY_SOURCE", html=raw if path.suffix.lower() in {".htm", ".html"} else None, source_role=source_role(form_type=actual_form, text=text)))
         return result
 
     def _normalized_sources(self, ticker: str) -> list[CachedGovernanceSource]:
         if self.normalized is None:
             return []
         result: list[CachedGovernanceSource] = []
-        for source in self.normalized.sources(ticker, forms=("DEF 14A", "DEFA14A", "10-K", "8-K", "8-K/A"), as_of_date=self.as_of_date):
+        for source in self.normalized.sources(ticker, forms=("DEF 14A", "DEFA14A", "10-K", "10-Q", "20-F", "6-K", "8-K", "8-K/A"), as_of_date=self.as_of_date):
             result.append(CachedGovernanceSource(
                 ticker=source.ticker,
                 accession_number=source.accession_number,
@@ -178,6 +187,7 @@ class GovernanceSourceCatalog:
                 content_hash=source.content_hash,
                 available_date=source.available_date,
                 html=source.html or None,
+                source_role=source_role(form_type=source.form_type, title=source.title, text=source.text),
             ))
         return result
 
@@ -230,6 +240,52 @@ class GovernanceSourceCatalog:
         if selected is not None and selected.local_path:
             return replace(selected, text=self._usable_text(selected.local_path, selected.text))
         return selected
+
+    def primary_sources(self, ticker: str) -> list[CachedGovernanceSource]:
+        """Return all eligible authoritative management/governance sources."""
+        values = self.sources(ticker)
+        eligible = [item for item in values if item.roles & {"MANAGEMENT_PRIMARY", "BOARD_PRIMARY", "GOVERNANCE_PRIMARY", "AGM_PRIMARY", "ANNUAL_REPORT_PRIMARY"}]
+        # A 6-K is a container, not automatically a roster.  Exclude generic
+        # regulatory/PDMR notices from the primary governance handoff unless
+        # their text actually establishes AGM, board, committee, or role
+        # change evidence.
+        eligible = [
+            item for item in eligible
+            if item.form_type.upper() not in {"6-K", "8-K", "8-K/A"}
+            or bool(re.search(
+                r"annual general meeting|result(?:s)? of (?:the )?AGM|board of directors|committee|governance|appointed|stepped down|resigned|retired|chief executive|chief financial|executive committee",
+                item.text or "", re.I,
+            ))
+        ]
+        return sorted(eligible, key=lambda item: (item.filing_date or "", item.accession_number))
+
+    def latest_primary(self, ticker: str) -> CachedGovernanceSource | None:
+        values = self.primary_sources(ticker)
+        # The latest filing is not necessarily the latest usable governance
+        # roster: a later 6-K may be a PDMR notice while an earlier AGM result
+        # or annual filing carries the board and committee evidence.  Rank
+        # authoritative governance content first, then recency within that
+        # evidence class.  This remains issuer/jurisdiction neutral.
+        def rank(item: CachedGovernanceSource) -> tuple[int, int, int, str, str]:
+            text = item.text or ""
+            evidence = 1 if re.search(
+                r"annual general meeting|result(?:s)? of (?:the )?agm|board of directors|board composition|committee|governance|director nominees|executive committee",
+                text,
+                re.I,
+            ) else 0
+            role_rank = {
+                "DEF 14A": 6,
+                "DEFA14A": 6,
+                "20-F": 5,
+                "10-K": 5,
+                "AGM_PRIMARY": 5,
+                "BOARD_PRIMARY": 4,
+                "ANNUAL_REPORT_PRIMARY": 3,
+                "GOVERNANCE_PRIMARY": 3,
+            }.get(item.form_type.upper(), 1)
+            source_rank = {"AGM_PRIMARY": 6, "BOARD_PRIMARY": 5, "MANAGEMENT_PRIMARY": 2}.get(item.source_role or "", 1)
+            return (evidence, role_rank, source_rank, item.filing_date or "", item.accession_number)
+        return max(values, key=rank, default=None)
 
     def subsequent_events(self, ticker: str, after: str | None = None) -> list[CachedGovernanceSource]:
         values = [source for source in self.sources(ticker) if source.form_type.upper() in {"8-K", "8-K/A"} and (not after or (source.filing_date or "") > after)]

@@ -36,6 +36,10 @@ def _window(text: str, name: str, limit: int = 420) -> str:
 
 def infer_independence(row: BoardMembership, person: ManagementPerson | None, proxy_text: str = "") -> tuple[str, str, str]:
     row_evidence = (row.evidence_text or "").lower()
+    # The flattened proxy adapter appends this phrase when a row had no
+    # machine-readable classification.  It is not evidence of a negative
+    # independence determination and must not override an explicit table cell.
+    row_evidence = re.sub(r";\s*not independently classified\s*$", "", row_evidence)
     # Flattened proxy nominee tables retain an explicit Yes/No independence
     # column.  Prefer that fact over broad title heuristics.
     if re.search(r"\|\s*yes\s*\|", row_evidence):
@@ -53,6 +57,33 @@ def infer_independence(row: BoardMembership, person: ManagementPerson | None, pr
     if re.search(r"\bindependent\s+(?:chair|director)\b", row_evidence) or re.search(r"\bindependent\b", row_evidence):
         return "INDEPENDENT", "issuer explicitly states independent", "proxy"
     if proxy_text and person:
+        # Proxy summaries often state a complete rule rather than repeating
+        # an independence cell for every nominee (for example, ``12 of 14
+        # nominees are independent, all except the CEO and employee nominee``).
+        # Apply that rule only when the exception set is explicit; do not turn
+        # a generic ``majority independent`` statement into a per-person fact.
+        summary = re.search(
+            r"\b\d+\s+of\s+\d+\s+(?:director\s+)?nominees?\s+are\s+independent"
+            r"\s*\((?P<exceptions>[^)]{3,300})\)",
+            proxy_text,
+            re.IGNORECASE,
+        )
+        if summary:
+            exceptions = summary.group("exceptions")
+            last_name = re.findall(r"[A-Za-z]{3,}", person.full_name)[-1] if person.full_name else ""
+            if last_name and re.search(r"\b" + re.escape(last_name) + r"\b", exceptions, re.IGNORECASE):
+                return "NOT_INDEPENDENT", "explicit proxy nominee exception", "proxy"
+            issuer_tokens = [token for token in re.findall(r"[a-z0-9]+", (person.company_name or "").lower()) if len(token) > 3]
+            issuer_context = bool(issuer_tokens and any(re.search(r"\b" + re.escape(token) + r"\b", row_evidence, re.IGNORECASE) for token in issuer_tokens))
+            if re.search(r"\b(?:ceo|chief\s+executive|executive\s+chair)\b", exceptions, re.IGNORECASE) and issuer_context and re.search(r"\b(?:ceo|chief\s+executive|executive\s+chair)\b", row_evidence, re.IGNORECASE):
+                return "NOT_INDEPENDENT", "explicit proxy nominee exception", "proxy"
+            # Employee/union nominees are frequently described by occupation
+            # rather than surname.  This bounded vocabulary is semantic, not
+            # issuer-specific, and is used only when the proxy names that
+            # class as an exception.
+            if re.search(r"\b(?:employee|union|labor|labou?r|association|pilot|captain|worker|nominee)\b", exceptions, re.IGNORECASE) and re.search(r"\b(?:employee|union|labor|labou?r|association|pilot|captain|worker)\b", row_evidence, re.IGNORECASE):
+                return "NOT_INDEPENDENT", "explicit proxy nominee exception", "proxy"
+            return "INDEPENDENT", "explicit proxy nominee independence summary", "proxy"
         # Explicit issuer exceptions must take precedence over broad
         # independence summaries.  A flattened proxy often lists the
         # independent nominees first and later states that the CEO/founder is
@@ -90,6 +121,14 @@ def build_board_memberships(store: ManagementStore, ticker: str, *, as_of_date: 
     ticker = ticker.strip().upper()
     people = {person.person_id: person for person in store.list_people()}
     rows = [row for row in store.list_boards() if (row.board_ticker or row.ticker).upper() == ticker and _as_of_current(row, as_of_date)]
+    # The latest eligible proxy is the authoritative current-board snapshot.
+    # Older proxy rows remain in the management store for tenure/history, but
+    # must not be merged into the current board simply because their
+    # ``is_current`` flag was true at the older filing date.
+    if proxy is not None and proxy.accession_number and proxy.is_proxy:
+        latest_source_rows = [row for row in rows if row.accession_number == proxy.accession_number or proxy.accession_number in set(row.source_accession_numbers or [])]
+        if latest_source_rows:
+            rows = latest_source_rows
     result: list[GovernanceBoardMembership] = []
     for row in rows:
         person = people.get(row.person_id)
@@ -101,12 +140,23 @@ def build_board_memberships(store: ManagementStore, ticker: str, *, as_of_date: 
             chair_status = "chair"
         elif person and any("chair" in item.lower() for item in person.current_roles):
             chair_status = "chair"
+        proxy_matches = bool(
+            proxy is not None
+            and proxy.accession_number
+            and (
+                row.accession_number == proxy.accession_number
+                or proxy.accession_number in set(row.source_accession_numbers or [])
+            )
+        )
+        source_filed_at = proxy.filing_date if proxy_matches else row.public_availability_date
+        source_period = proxy.report_date if proxy_matches else None
         result.append(GovernanceBoardMembership(
             board_membership_id=f"governance-board:{ticker}:{row.person_id}",
             person_id=row.person_id,
             ticker=ticker,
             issuer_cik=row.issuer_cik,
             board_role=row.board_role,
+            board_status=getattr(row, "board_status", "CURRENT"),
             is_current=True,
             start_date=row.start_date,
             end_date=row.end_date,
@@ -121,11 +171,23 @@ def build_board_memberships(store: ManagementStore, ticker: str, *, as_of_date: 
             source_url=row.source_url,
             source_accession=row.accession_number,
             source_form=row.form_type,
-            source_date=(proxy.filing_date if proxy and proxy.accession_number == row.accession_number else None),
+            source_date=source_filed_at,
+            source_filed_at=source_filed_at,
+            source_period=source_period,
+            as_of_eligibility=("ELIGIBLE" if not source_filed_at or source_filed_at <= as_of_date else "INELIGIBLE_FUTURE"),
             local_source_path=row.local_source_path,
+            normalized_document_id=proxy.normalized_document_id if proxy else None,
             evidence_text=evidence,
         ))
-    return sorted({item.board_membership_id: item for item in result}.values(), key=lambda item: item.person_id)
+    # Foreign annual reports and later AGM results can both describe the same
+    # seated director. Keep the richest current evidence deterministically;
+    # domestic proxy behavior remains source-scoped above.
+    selected: dict[str, GovernanceBoardMembership] = {}
+    for item in result:
+        previous = selected.get(item.person_id)
+        if previous is None or (item.is_current and not previous.is_current) or len(item.evidence_text or "") > len(previous.evidence_text or ""):
+            selected[item.person_id] = item
+    return sorted(selected.values(), key=lambda item: item.person_id)
 
 
 def leadership_structure(memberships: Iterable[GovernanceBoardMembership], roles: Iterable, people: Iterable[ManagementPerson] = ()) -> dict[str, object]:

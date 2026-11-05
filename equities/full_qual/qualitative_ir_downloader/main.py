@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import csv
 import logging
+import re
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -33,6 +34,7 @@ from .company_context import CompanyContext, MediaBudget, prepare_company_contex
 from .scoring import company_key
 from .event_outcomes import company_outcome
 from .company_identity import identify
+from .corporate_domain import IMPLEMENTATION_VERSION as DOMAIN_IMPLEMENTATION_VERSION
 from .production_status import (
     aggregate_status,
     cache_metrics,
@@ -47,7 +49,9 @@ from .report_accounting import (
     failure_stage,
     is_report_candidate,
     report_metrics,
+    report_coverage_diagnostics,
 )
+from .acquisition_priority import critical_source_coverage, sort_documents
 from .urls import canonicalize_url
 from .official_sources import OfficialSourceStrategy, SOURCE_NEWSROOM
 from .reliability import (
@@ -55,6 +59,68 @@ from .reliability import (
     AcquisitionProgressTimeout,
     ProgressTracker,
 )
+
+_SOURCE_ARCHIVE_CIK_RE = re.compile(r"/Archives/edgar/data/(\d{1,10})/", re.I)
+_SOURCE_ACCESSION_RE = re.compile(r"(?<!\d)(\d{10})-\d{2}-\d{6}(?!\d)")
+
+
+def annotate_source_identity(document, *, canonical_cik: str | None, canonical_name: str | None = None):
+    """Attach and validate source registrant identity before materialization."""
+    canonical = str(canonical_cik or "").zfill(10) if canonical_cik else None
+    document.canonical_registrant_cik = canonical
+    document.canonical_registrant_name = canonical_name
+    archive_ciks: list[str] = []
+    accession_ciks: list[str] = []
+    provenance_ciks: list[str] = []
+    for provenance in document.provenance or []:
+        accession = str(provenance.get("accession_number") or "")
+        if provenance.get("issuer_cik"):
+            provenance_ciks.append(str(provenance["issuer_cik"]).zfill(10))
+        for value in (accession, str(provenance.get("source_url") or "")):
+            archive = _SOURCE_ARCHIVE_CIK_RE.search(value)
+            if archive:
+                archive_ciks.append(archive.group(1).zfill(10))
+            match = _SOURCE_ACCESSION_RE.search(value)
+            if match:
+                accession_ciks.append(match.group(1))
+    source_url = str(document.source_url or "")
+    archive = _SOURCE_ARCHIVE_CIK_RE.search(source_url)
+    if archive:
+        archive_ciks.append(archive.group(1).zfill(10))
+    match = _SOURCE_ACCESSION_RE.search(source_url)
+    if match:
+        accession_ciks.append(match.group(1))
+    # Filing agents often own the accession prefix (for example 0001193125)
+    # while the archive path and issuer metadata identify the registrant. Use
+    # the canonical CIK whenever any filing-level evidence matches it.
+    evidence_ciks = archive_ciks + accession_ciks + provenance_ciks
+    source_cik = next((cik for cik in evidence_ciks if canonical and cik == canonical), None)
+    if not source_cik:
+        source_cik = document.source_registrant_cik or (archive_ciks[0] if archive_ciks else (accession_ciks[0] if accession_ciks else (provenance_ciks[0] if provenance_ciks else None)))
+    document.source_registrant_cik = str(source_cik).zfill(10) if source_cik else None
+    if document.source_registrant_cik and canonical:
+        compatible = document.source_registrant_cik == canonical
+        document.source_lineage_relation = "CANONICAL_REGISTRANT" if compatible else "AFFILIATE"
+        document.source_identity_eligible = compatible
+    else:
+        document.source_lineage_relation = document.source_lineage_relation or "UNKNOWN"
+        document.source_identity_eligible = True
+    if document.provenance:
+        document.provenance[0].update({
+            "canonical_registrant_cik": canonical or "",
+            "canonical_registrant_name": canonical_name or "",
+            "source_registrant_cik": document.source_registrant_cik or "",
+            "source_lineage_relation": document.source_lineage_relation,
+            "source_identity_eligible": "true" if document.source_identity_eligible else "false",
+        })
+        # Accession identity is authoritative when an older cached
+        # provenance row carried the serving/affiliate CIK. Preserve the raw
+        # value for auditability, but expose the validated filing CIK to the
+        # normalized SEC catalog and downstream source routers.
+        if document.source_registrant_cik and document.provenance[0].get("issuer_cik") and str(document.provenance[0].get("issuer_cik")).zfill(10) != document.source_registrant_cik:
+            document.provenance[0]["raw_issuer_cik"] = str(document.provenance[0].get("issuer_cik"))
+            document.provenance[0]["issuer_cik"] = document.source_registrant_cik
+    return document
 
 
 def _newsroom_coverage_diagnostic(data: dict) -> str:
@@ -103,9 +169,38 @@ def _finalize_production_status(
     applicable = not browser.config.events.only
     news_metrics = document_metrics(data, "news")
     reports_metrics = document_metrics(data, "reports")
+    report_coverage = report_coverage_diagnostics(data.get("reports", []), discovered=reports_metrics.get("discovered"))
+    data["report_coverage"] = report_coverage
+    # A report category can be technically downloaded while still lacking the
+    # minimum issuer corpus needed for period/state analysis.  Keep this
+    # distinction explicit: report discovery success must not masquerade as
+    # critical-source coverage success.
+    critical_coverage = critical_source_coverage(
+        data.get("reports", []),
+        as_of_date=data.get("as_of_date"),
+    )
+    data["critical_source_coverage"] = critical_coverage
+    critical_limitations: list[str] = []
+    if reports_metrics.get("discovered"):
+        for key, code in (
+            ("annual", "CRITICAL_ANNUAL_SOURCE_MISSING"),
+            ("interim", "CRITICAL_INTERIM_SOURCE_MISSING"),
+            ("governance", "CRITICAL_GOVERNANCE_SOURCE_MISSING"),
+        ):
+            if not critical_coverage.get(key):
+                critical_limitations.append(code)
     news_state = category_status(data, "news", applicable=applicable, scanned=("news" in data if applicable else None))
     reports_state = category_status(data, "reports", applicable=applicable, scanned=("reports" in data if applicable else None))
     ir_state_value = ir_status(data, winner=winner)
+    if report_coverage.get("limitations") and reports_state == "SUCCESS":
+        reports_state = "SUCCESS_WITH_LIMITATIONS"
+    if critical_limitations and reports_state == "SUCCESS":
+        reports_state = "SUCCESS_WITH_LIMITATIONS"
+    data["critical_source_coverage_status"] = (
+        "COMPLETE" if critical_coverage.get("minimum_research_corpus_acquired") else
+        "INCOMPLETE" if reports_metrics.get("discovered") else "NOT_AVAILABLE"
+    )
+    data["critical_source_limitations"] = critical_limitations
     events_state = event_status(event_metrics, data) if browser.config.events.enabled else "NOT_APPLICABLE"
     overall, limitations = aggregate_status(
         ir=ir_state_value,
@@ -116,7 +211,11 @@ def _finalize_production_status(
         reports_metrics=reports_metrics,
         event_metrics=event_metrics,
         official_evidence=bool(data.get("official_source_evidence")),
-        source_limitations=data.get("official_source_limitations", []),
+        source_limitations=(
+            list(data.get("official_source_limitations", []) or [])
+            + list(report_coverage.get("limitations", []) or [])
+            + critical_limitations
+        ),
     )
     data.update(
         ir_status=ir_state_value,
@@ -178,25 +277,54 @@ async def _save_official_documents(
     manifest: Manifest,
     documents_by_category: dict[str, list],
     max_documents: int | None = None,
+    as_of_date: str | None = None,
+    stop_after_critical_financial: bool = False,
 ) -> tuple[Downloader, int]:
     """Materialize issuer-verified fallback documents without an IR winner."""
-    downloader = Downloader(browser, context, folder, stock.ticker, stock.company_name)
+    downloader = Downloader(browser, context, folder, stock.ticker, stock.company_name, issuer_context=manifest.data.get("ecosystem") or None)
     downloader.register_existing(list(manifest.data.get("news", [])) + list(manifest.data.get("reports", [])))
     failed = 0
-    for category in ("news", "reports"):
+    for category in ("reports", "news"):
         discovered = list(documents_by_category.get(category, []) or [])
+        discovered = sort_documents(discovered, as_of_date=as_of_date)
         raw_count = len(discovered)
         if category == "reports":
             discovered = [document for document in discovered if is_report_candidate(document)]
             manifest.data["raw_report_candidates"] = raw_count
         manifest.data[f"discovered_{category}"] = [asdict(document) for document in discovered]
         manifest.data.setdefault("archive_pages", {})[category] = 0
+        materialized = 0
         for document in discovered[:max_documents] if max_documents else discovered:
+            annotate_source_identity(document, canonical_cik=manifest.data.get("issuer_cik"), canonical_name=stock.company_name)
+            if not document.source_identity_eligible:
+                failed += 1
+                document.status = "REJECTED"
+                document.failure_stage = "SOURCE_IDENTITY"
+                document.failure_code = "SOURCE_IDENTITY_INCOMPATIBLE"
+                document.failure_classification = "SOURCE_IDENTITY_INCOMPATIBLE"
+                document.failure_reason = "Source registrant is not compatible with the canonical ticker registrant"
+                manifest.document(document)
+                manifest.error(Issue(document.failure_code, document.failure_reason, document.source_url))
+                continue
             try:
                 saved = await downloader.save(document)
                 saved.status = "CACHED" if saved.cache_hit else "DOWNLOADED"
                 saved.existing_artifact = bool(saved.cache_hit)
                 manifest.document(saved)
+                materialized += 1
+                if stop_after_critical_financial and category == "reports":
+                    coverage = critical_source_coverage(
+                        manifest.data.get("reports", []),
+                        as_of_date=as_of_date,
+                    )
+                    if coverage.get("financial"):
+                        # Tier 1 has established the annual plus current
+                        # interim/results corpus.  Leave the reserved
+                        # governance/management stage and lower-priority
+                        # stages their own budgets instead of backfilling
+                        # every historical filing in this loop.
+                        manifest.data["critical_financial_documents_processed"] = materialized
+                        break
             except Exception as exc:
                 failed += 1
                 code = getattr(exc, "code", "PDF_DOWNLOAD_FAILED" if document.category == "reports" else "HTML_TO_PDF_FAILED")
@@ -209,7 +337,7 @@ async def _save_official_documents(
                 manifest.error(Issue(code, str(exc), document.source_url))
     return downloader, failed
 
-async def process_company(browser: Browser, stock: Stock, timestamp: str, max_documents: int | None = None, *, scan_only=False, issuer_cik: str | None = None, issuer_resolution_source: str | None = None) -> dict:
+async def process_company(browser: Browser, stock: Stock, timestamp: str, max_documents: int | None = None, *, scan_only=False, issuer_cik: str | None = None, issuer_resolution_source: str | None = None, as_of_date: str | None = None) -> dict:
     company_started=time.perf_counter()
     key = (stock.ticker.casefold(), company_key(stock.company_name))
     prepared = getattr(browser, "prepared_companies", {})
@@ -226,6 +354,25 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
     cached_identity = runtime.verified_ir
     runtime.verified_ir = cached_identity
     manifest = Manifest(folder, stock, timestamp, resume=resume)
+    if as_of_date:
+        manifest.data["as_of_date"] = as_of_date
+    manifest.data["acquisition_stage_order"] = [
+        "IDENTITY",
+        "CRITICAL_FINANCIAL_DISCOVERY",
+        "CRITICAL_FINANCIAL_DOWNLOAD",
+        "GOVERNANCE_MANAGEMENT_DISCOVERY",
+        "RESULTS_PRESENTATIONS",
+        "REGULATORY_NEWS",
+        "GENERAL_NEWS",
+        "DEEP_ARCHIVE",
+    ]
+    manifest.data["acquisition_stage_budgets"] = {
+        "identity": float(getattr(browser.config, "identity_budget", 60.0)),
+        "critical_financial": float(getattr(browser.config, "critical_financial_budget", 300.0)),
+        "governance_management": float(getattr(browser.config, "governance_budget", 180.0)),
+        "news": float(getattr(browser.config, "news_budget", 180.0)),
+        "deep_archive": float(getattr(browser.config, "deep_archive_budget", 60.0)),
+    }
     tracker = ProgressTracker(
         folder,
         stock.ticker,
@@ -239,6 +386,8 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
     manifest.write()
     if issuer_cik:
         manifest.data["issuer_cik"] = str(issuer_cik)
+        manifest.data["canonical_registrant_cik"] = str(issuer_cik).zfill(10)
+        manifest.data["canonical_registrant_name"] = stock.company_name
     if issuer_resolution_source:
         manifest.data["issuer_resolution_source"] = str(issuer_resolution_source)
     event_metrics = {}
@@ -249,6 +398,19 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
     downloader = None
     official_source_result = {"documents": [], "documents_by_category": {"news": [], "reports": []}, "routes": [], "statuses": {}, "limitations": [], "coverage_status": "ALL_OFFICIAL_SOURCES_UNUSABLE", "usable": False}
     manifest.data.update(ir_official=bool(cached_identity), ir_accessible=False, rss_feeds=[], discovery_errors=[])
+    def stage_budget(stage: str) -> float:
+        """Return a bounded stage budget without exceeding the issuer deadline."""
+        configured = {
+            "identity": float(getattr(browser.config, "identity_budget", 60.0)),
+            "reports": float(getattr(browser.config, "critical_financial_budget", 300.0)),
+            "governance": float(getattr(browser.config, "governance_budget", 180.0)),
+            "news": float(getattr(browser.config, "news_budget", 180.0)),
+            "archive": float(getattr(browser.config, "deep_archive_budget", 60.0)),
+        }.get(stage, float(getattr(browser.config, "stage_timeout", 900.0)))
+        remaining = float(getattr(browser.config, "acquisition_deadline", 0.0)) - tracker.elapsed
+        if remaining <= 0:
+            return 0.1
+        return max(0.1, min(configured, float(getattr(browser.config, "stage_timeout", configured)), remaining))
     if cached_identity:
         log.info("[%s] verified IR cache hit: %s; no rediscovery",stock.ticker,cached_identity.url)
         manifest.data["investor_relations_url"] = cached_identity.url
@@ -258,26 +420,52 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
         async with browser.session() as context:
             discovery = IRDiscovery(browser)
             discovery.identity=identify(stock.company_name);discovery.ticker=stock.ticker
-            tracker.start("ISSUER_RESOLUTION", item=stock.ticker)
+            manifest.data.update({
+                "requested_ticker": stock.ticker,
+                "sec_registrant_name": stock.company_name,
+                "company_display_name": stock.company_name,
+                "corporate_brand_name": discovery.identity.normalized_company_name,
+                "domain_resolution_implementation": DOMAIN_IMPLEMENTATION_VERSION,
+            })
+            tracker.start("ISSUER_RESOLUTION", item=stock.ticker, priority_tier=0, budget_seconds=stage_budget("identity"), budget_remaining_seconds=stage_budget("identity"))
             winner = cached_identity
             fresh = None
             if not winner or (browser.config.revalidate_ir and not runtime.scanned):
-                tracker.start("IR_DISCOVERY", item=stock.ticker)
+                tracker.start("IR_DISCOVERY", item=stock.ticker, priority_tier=0, budget_seconds=stage_budget("identity"), budget_remaining_seconds=stage_budget("identity"))
                 try:
-                    discovery_timeout = min(
-                        float(getattr(browser.config, "stage_timeout", 900.0)),
-                        float(getattr(browser.config, "acquisition_deadline", 7200.0)),
+                    discovery_timeout = stage_budget("identity")
+                    # Preserve the historical three-argument call when no
+                    # issuer CIK is available; test/extension implementations
+                    # may intentionally expose that stable interface.  The
+                    # optional CIK is supplied only for authoritative identity
+                    # aware discovery.
+                    resolved_cik = issuer_cik or manifest.data.get("issuer_cik")
+                    discovery_call = (
+                        discovery.discover_investor_relations_site(
+                            stock.ticker, stock.company_name, context, issuer_cik=resolved_cik
+                        )
+                        if resolved_cik
+                        else discovery.discover_investor_relations_site(
+                            stock.ticker, stock.company_name, context
+                        )
                     )
-                    fresh = await asyncio.wait_for(
-                        discovery.discover_investor_relations_site(stock.ticker, stock.company_name, context),
-                        timeout=discovery_timeout,
-                    )
+                    fresh = await asyncio.wait_for(discovery_call, timeout=discovery_timeout)
                 except Exception as exc:
                     # A bounded transport/search timeout cannot erase ownership already proven.
                     proven=[c for c in discovery.candidates if c.official]
                     fresh=max(proven,key=lambda c:c.officiality_score) if proven else None
                     discovery.errors.append(Issue("IR_DISCOVERY_BUDGET_EXHAUSTED" if isinstance(exc,TimeoutError) else "IR_DISCOVERY_FAILED", str(exc)))
                 if fresh and fresh.official:
+                    # A verified IR URL on the issuer's exact branded root
+                    # is stronger than a regional/search-discovered corporate
+                    # candidate.  Promote that registrable domain as the
+                    # canonical corporate identity while retaining hosted IR
+                    # domains (ir./investor.) as separate relationships.
+                    from .ir_discovery import DOMAIN
+                    from .ir_evidence import brand_domain
+                    winner_host = DOMAIN(fresh.url)
+                    if winner_host.subdomain in ("", "www") and brand_domain(fresh.url, stock.company_name) == 2:
+                        fresh.corporate_url = f"https://{winner_host.top_domain_under_public_suffix}/"
                     try:
                         ir_state.upsert(browser.config.download_root, stock, fresh, confirmed=fresh.content_validated)
                     except (OSError, ValueError) as exc:
@@ -290,6 +478,27 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                 tracker.skipped("IR_DISCOVERY", item=stock.ticker, reason="VERIFIED_CACHE_REUSED")
                 tracker.complete("ISSUER_RESOLUTION", processed=1, reused=1)
             if winner:
+                from .ir_discovery import DOMAIN
+                from .ir_evidence import brand_domain
+                winner_host = DOMAIN(winner.url)
+                if winner_host.subdomain in ("", "www") and brand_domain(winner.url, stock.company_name) == 2:
+                    winner.corporate_url = f"https://{winner_host.top_domain_under_public_suffix}/"
+                    # Upgrade a legacy verified-IR cache entry whose
+                    # corporate relationship was learned from a regional
+                    # search result.  The selected branded-root IR URL is
+                    # stronger evidence, so persist the corrected relationship
+                    # without reacquiring any source documents.
+                    if cached_identity:
+                        try:
+                            ir_state.upsert(
+                                browser.config.download_root,
+                                stock,
+                                winner,
+                                source="domain_relationship_revalidation",
+                                confirmed=True,
+                            )
+                        except (OSError, ValueError) as exc:
+                            log.warning("Verified IR cache domain upgrade failed; identity retained: %s", exc)
                 if runtime.scanned:
                     discovery.ecosystem = runtime.ecosystem
                 if winner.url not in discovery.ecosystem.verified_ir_urls:
@@ -322,6 +531,8 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
             manifest.data["discovery"] = [asdict(c) for c in discovery.candidates]
             manifest.data["discovery_errors"] = [asdict(e) for e in discovery.errors]
             manifest.data["ecosystem"] = asdict(discovery.ecosystem)
+            manifest.data["corporate_domain"] = discovery.ecosystem.official_corporate_domain
+            manifest.data["corporate_domain_verification_status"] = "VERIFIED_CORPORATE" if discovery.ecosystem.official_corporate_domain else "UNVERIFIED"
             manifest.data["rss_feeds"] = discovery.rss_feeds
             if not winner:
                 for issue in discovery.errors:
@@ -333,7 +544,7 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                 # search must not prevent a verified issuer CIK from yielding
                 # filings that can be normalized downstream.
                 try:
-                    tracker.start("SEC_DISCOVERY", item=stock.ticker)
+                    tracker.start("SEC_DISCOVERY", item=stock.ticker, priority_tier=1, budget_seconds=stage_budget("reports"), budget_remaining_seconds=stage_budget("reports"))
                     source_strategy = OfficialSourceStrategy(
                         browser,
                         context,
@@ -343,7 +554,9 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                         cache_root=browser.config.download_root,
                         issuer_cik=issuer_cik or manifest.data.get("issuer_cik"),
                     )
-                    official_source_result = await source_strategy.discover()
+                    official_source_result = await asyncio.wait_for(
+                        source_strategy.discover(critical_only=True), timeout=stage_budget("reports")
+                    )
                     tracker.complete("SEC_DISCOVERY", discovered=len(official_source_result.get("documents", [])), processed=1, network_requests=len(browser.access_events))
                     manifest.data["official_source_routes"] = official_source_result.get("routes", [])
                     manifest.data["official_source_status"] = official_source_result.get("statuses", {})
@@ -360,6 +573,8 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                             manifest=manifest,
                             documents_by_category=official_source_result.get("documents_by_category", {}),
                             max_documents=max_documents,
+                            as_of_date=as_of_date,
+                            stop_after_critical_financial=True,
                         )
                         failed_downloads += fallback_failures
                 except Exception as exc:
@@ -377,7 +592,7 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                 # current landing route is blocked.  Probe bounded alternate
                 # official routes before treating the company as empty.
                 try:
-                    tracker.start("IR_VERIFICATION", item=winner.url)
+                    tracker.start("IR_VERIFICATION", item=winner.url, priority_tier=0, budget_seconds=stage_budget("reports"), budget_remaining_seconds=stage_budget("reports"))
                     source_strategy = OfficialSourceStrategy(
                         browser,
                         context,
@@ -387,7 +602,9 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                         cache_root=browser.config.download_root,
                         issuer_cik=issuer_cik or manifest.data.get("issuer_cik"),
                     )
-                    official_source_result = await source_strategy.discover()
+                    official_source_result = await asyncio.wait_for(
+                        source_strategy.discover(critical_only=True), timeout=stage_budget("reports")
+                    )
                     tracker.complete("IR_VERIFICATION", discovered=len(official_source_result.get("documents", [])), processed=1, network_requests=len(browser.access_events))
                 except Exception as exc:
                     if isinstance(exc, (AcquisitionProgressTimeout, AcquisitionDeadlineExceeded)):
@@ -403,20 +620,66 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                 manifest.data["primary_ir_status"] = "BLOCKED" if winner.access.blocked and not (winner.access.browser_accessible or winner.access.http_accessible) else "SUCCESS"
                 manifest.write()
                 scope = Scope(discovery.ecosystem.verified_ir_urls or [winner.url])
-                downloader = Downloader(browser, context, folder, stock.ticker, stock.company_name)
+                # Materialize verified financial/governance fallback documents
+                # before touching broad archive/news routes.  This is the
+                # critical-source-first boundary: a slow newsroom cannot
+                # starve annual/interim/results/governance acquisition.
+                critical_documents = official_source_result.get("documents_by_category", {}).get("reports", [])
+                if critical_documents:
+                    tracker.start("CRITICAL_FINANCIAL_DOWNLOAD", item=stock.ticker, priority_tier=1)
+                    downloader, fallback_failures = await _save_official_documents(
+                        browser=browser,
+                        context=context,
+                        folder=folder,
+                        stock=stock,
+                        manifest=manifest,
+                        documents_by_category={"reports": critical_documents},
+                        max_documents=max_documents,
+                        as_of_date=as_of_date,
+                        stop_after_critical_financial=True,
+                    )
+                    failed_downloads += fallback_failures
+                    coverage = critical_source_coverage(manifest.data.get("reports", []), as_of_date=as_of_date)
+                    manifest.data["critical_source_coverage"] = coverage
+                    manifest.data["critical_source_coverage_status"] = (
+                        "COMPLETE" if coverage.get("minimum_research_corpus_acquired") else "INCOMPLETE"
+                    )
+                    tracker.complete("CRITICAL_FINANCIAL_DOWNLOAD", processed=len(critical_documents), failed=fallback_failures, priority_tier=1, **{key: value for key, value in coverage.items() if isinstance(value, bool)})
+                else:
+                    downloader = Downloader(browser, context, folder, stock.ticker, stock.company_name, issuer_context=discovery.ecosystem)
                 # Existing records are reused only after URL, category, date,
                 # local-file, and (when available) content-hash validation.
                 downloader.register_existing(
                     list(manifest.data.get("news", [])) + list(manifest.data.get("reports", []))
                 )
                 provider = None
-                categories = () if browser.config.events.only else (("news", find_news_section, "NEWS_SECTION_NOT_FOUND"), ("reports", find_reports_section, "REPORT_SECTION_NOT_FOUND"))
+                categories = () if browser.config.events.only else (("reports", find_reports_section, "REPORT_SECTION_NOT_FOUND"), ("news", find_news_section, "NEWS_SECTION_NOT_FOUND"))
                 for category, finder, missing in categories:
                     discovery_stage = "NEWS_DISCOVERY" if category == "news" else "REPORT_DISCOVERY"
                     download_stage = "NEWS_DOWNLOAD" if category == "news" else "REPORT_DOWNLOAD"
-                    tracker.start(discovery_stage, item=category)
+                    category_budget = stage_budget("news" if category == "news" else "reports")
+                    category_deadline = time.monotonic() + category_budget
+                    def category_timeout() -> float:
+                        return max(0.1, min(
+                            float(getattr(browser.config, "stage_timeout", category_budget)),
+                            category_deadline - time.monotonic(),
+                        ))
+                    tracker.start(
+                        discovery_stage,
+                        item=category,
+                        priority_tier=1 if category == "reports" else 5,
+                        budget_seconds=category_budget,
+                        budget_remaining_seconds=max(0.0, category_deadline - time.monotonic()),
+                    )
                     category_errors = []
-                    if winner.access.browser_accessible and not winner.content_validated and not cached_identity:
+                    # A browser landing-page validation failure must not hide
+                    # independently verified official-source artifacts (for
+                    # example a public newsroom or presentations route).  The
+                    # source strategy has already established issuer identity
+                    # for those documents, so only skip the primary archive
+                    # path when no verified fallback evidence exists.
+                    if (winner.access.browser_accessible and not winner.content_validated
+                            and not cached_identity and not official_source_result.get("documents")):
                         manifest.error(Issue("IR_VALIDATION_FAILED", "Retrieved page did not validate as company IR content", winner.url))
                         continue
                     seeds = []
@@ -425,7 +688,7 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                     try:
                         seeds = await asyncio.wait_for(
                             finder(page, winner.url, browser, scope, stock.company_name),
-                            timeout=float(getattr(browser.config, "stage_timeout", 900.0)),
+                            timeout=category_timeout(),
                         )
                     except Exception as exc:
                         if isinstance(exc, (AcquisitionProgressTimeout, AcquisitionDeadlineExceeded)):
@@ -449,7 +712,7 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                         remaining = browser.config.max_links_per_company - (len(manifest.data.get("discovered_news", [])) if category == "reports" else 0)
                         archive = await asyncio.wait_for(
                             ArchiveCrawler(browser, scope).collect(context, seeds, category, remaining),
-                            timeout=float(getattr(browser.config, "stage_timeout", 900.0)),
+                            timeout=category_timeout(),
                         ) if seeds else ArchiveResult()
                     except Exception as exc:
                         if isinstance(exc, (AcquisitionProgressTimeout, AcquisitionDeadlineExceeded)):
@@ -462,7 +725,7 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                         manifest.data["rss_feeds"] = list(dict.fromkeys(manifest.data["rss_feeds"] + archive.rss_feeds))
                         feed_docs, feed_errors = await asyncio.wait_for(
                             collect_feeds(browser, context, manifest.data["rss_feeds"], scope, winner.url),
-                            timeout=float(getattr(browser.config, "stage_timeout", 900.0)),
+                            timeout=category_timeout(),
                         )
                         existing = {d.source_url for d in archive.documents}
                         for document in feed_docs:
@@ -511,9 +774,21 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                     if max_documents and len(documents) > max_documents:
                         manifest.error(Issue("SAFETY_LIMIT_REACHED", f"Explicit test limit: only {max_documents} {category} documents"))
                         documents = documents[:max_documents]
+                    documents = sort_documents(documents, as_of_date=as_of_date)
                     manifest.data[category] = [asdict(d) for d in archive.documents]
                     manifest.write()
                     for index, document in enumerate(documents, 1):
+                        annotate_source_identity(document, canonical_cik=manifest.data.get("issuer_cik"), canonical_name=stock.company_name)
+                        if not document.source_identity_eligible:
+                            failed_downloads += 1
+                            document.status = "REJECTED"
+                            document.failure_stage = "SOURCE_IDENTITY"
+                            document.failure_code = "SOURCE_IDENTITY_INCOMPATIBLE"
+                            document.failure_classification = "SOURCE_IDENTITY_INCOMPATIBLE"
+                            document.failure_reason = "Source registrant is not compatible with the canonical ticker registrant"
+                            manifest.document(document)
+                            manifest.error(Issue(document.failure_code, document.failure_reason, document.source_url))
+                            continue
                         tracker.check()
                         tracker.start(download_stage, item=document.source_url)
                         event_start = len(browser.access_events)
@@ -564,6 +839,37 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
                                              network_requests=len(browser.access_events))
                     tracker.complete(download_stage, processed=len(documents), failed=failed_downloads,
                                      network_requests=len(browser.access_events))
+                    coverage = critical_source_coverage(
+                        manifest.data.get("reports", []),
+                        as_of_date=as_of_date,
+                    )
+                    manifest.data["critical_source_coverage"] = coverage
+                    manifest.data["critical_source_coverage_status"] = (
+                        "COMPLETE" if coverage.get("minimum_research_corpus_acquired") else "INCOMPLETE"
+                    )
+                    if coverage.get("minimum_research_corpus_acquired"):
+                        manifest.data["minimum_research_corpus_acquired"] = True
+                        tracker.progress(
+                            "CRITICAL_COVERAGE_CHECKPOINT",
+                            item=stock.ticker,
+                            priority_tier=1,
+                            **{key: value for key, value in coverage.items() if isinstance(value, bool)},
+                        )
+                    if category == "reports":
+                        tracker.start(
+                            "GOVERNANCE_MANAGEMENT_DISCOVERY",
+                            item=stock.ticker,
+                            priority_tier=2,
+                            budget_seconds=stage_budget("governance"),
+                            budget_remaining_seconds=stage_budget("governance"),
+                        )
+                        tracker.complete(
+                            "GOVERNANCE_MANAGEMENT_DISCOVERY",
+                            processed=len(manifest.data.get("reports", [])),
+                            priority_tier=2,
+                            governance_source=bool(coverage.get("governance")),
+                            management_source=bool(coverage.get("management")),
+                        )
                 if browser.config.events.enabled:
                     tracker.start("EVENT_DISCOVERY", item=stock.ticker)
                     ir_setup_seconds=time.perf_counter()-company_started
@@ -680,6 +986,10 @@ async def process_company(browser: Browser, stock: Stock, timestamp: str, max_do
     summary['news_status'] = manifest.data.get('news_status')
     summary['news_coverage_diagnostic'] = manifest.data.get('news_coverage_diagnostic')
     summary['reports_status'] = manifest.data.get('reports_status')
+    summary['report_coverage'] = manifest.data.get('report_coverage', {})
+    summary['critical_source_coverage'] = manifest.data.get('critical_source_coverage', {})
+    summary['critical_source_coverage_status'] = manifest.data.get('critical_source_coverage_status', 'NOT_AVAILABLE')
+    summary['critical_source_limitations'] = manifest.data.get('critical_source_limitations', [])
     summary['events_status'] = manifest.data.get('events_status')
     summary['overall_status'] = manifest.data.get('overall_status', manifest.data.get('status'))
     summary['completeness'] = manifest.data.get('completeness', {})
@@ -732,12 +1042,17 @@ async def run(args) -> int:
     event_search = integration_search or args.discover_registration_destinations
     if args.skip_events and event_search:
         raise ValueError("Event search cannot be combined with --skip-events")
-    config = Config(service_account_path=args.service_account, download_root=args.download_root,
+    config = Config(as_of_date=getattr(args, "as_of_date", None), service_account_path=args.service_account, download_root=args.download_root,
                     request_delay=args.request_delay, max_archive_pages=args.max_archive_pages,
                     max_links_per_company=args.max_links_per_company, max_interactions=args.max_interactions, revalidate_ir=args.rediscover_ir,
                     no_progress_timeout=args.no_progress_timeout,
                     acquisition_deadline=args.acquisition_deadline,
                     stage_timeout=args.stage_timeout,
+                    critical_financial_budget=args.critical_financial_budget,
+                    governance_budget=args.governance_budget,
+                    news_budget=args.news_budget,
+                    deep_archive_budget=args.deep_archive_budget,
+                    archive_no_new_document_threshold=args.archive_no_new_document_threshold,
                     http_total_timeout=args.http_timeout,
                     events=EventConfig(enabled=not args.skip_events,approved_registration_domains=tuple(args.approved_registration_domain),max_media_attempts=args.max_media_attempts,discover_registration_destinations=args.discover_registration_destinations,skip_registration=args.skip_event_registration or args.discover_registration_destinations,generated_only=args.find_generatable_event,require_new_generated_event=args.require_new_generated_event,only=args.events_only or event_search,force=args.force_events,limit=args.event_limit or 1,model=args.whisper_model,language=None if args.whisper_language=="auto" else args.whisper_language,device=args.whisper_device,keep_media=args.keep_event_media,ffmpeg=args.ffmpeg))
     from dataclasses import replace
@@ -787,7 +1102,8 @@ async def run(args) -> int:
                     scan_started=time.perf_counter()
                     result = await process_company(browser, stock, timestamp, args.max_documents, scan_only=True,
                                                    issuer_cik=manual_issuer_cik,
-                                                   issuer_resolution_source="pipeline_runner" if manual_company_name else None)
+                                                   issuer_resolution_source="pipeline_runner" if manual_company_name else None,
+                                                   as_of_date=config.as_of_date)
                     result["scan_seconds"]=time.perf_counter()-scan_started
                     scans.append((stock, result))
                     rows.append(result)
@@ -798,7 +1114,8 @@ async def run(args) -> int:
                 try:
                     result = await process_company(browser, stock, timestamp, args.max_documents,
                                                    issuer_cik=manual_issuer_cik,
-                                                   issuer_resolution_source="pipeline_runner" if manual_company_name else None)
+                                                   issuer_resolution_source="pipeline_runner" if manual_company_name else None,
+                                                   as_of_date=config.as_of_date)
                     result.setdefault('timings',{}).update(google_sheets=sheets_time,total_run=time.perf_counter()-run_started)
                     log.info('Timing: %s',result['timings'])
                     row_index=next((i for i,r in enumerate(rows) if r.get("ticker")==stock.ticker and company_key(r.get("company_name",stock.company_name))==company_key(stock.company_name)),None)
@@ -901,6 +1218,7 @@ def parser() -> argparse.ArgumentParser:
     group.add_argument("--start-ticker")
     cli.add_argument("--company-name", help="Resolved issuer name for an explicit manual ticker; bypasses worksheet selection")
     cli.add_argument("--issuer-cik", help="Resolved SEC issuer CIK for an explicit manual ticker")
+    cli.add_argument("--as-of-date", help="PIT cutoff used to prioritize current documents")
     cli.add_argument("--limit", type=positive)
     cli.add_argument("--request-delay", type=nonnegative, default=1.0)
     cli.add_argument("--max-archive-pages", type=positive, default=250)
@@ -912,6 +1230,16 @@ def parser() -> argparse.ArgumentParser:
                      help="Maximum issuer acquisition wall-clock budget")
     cli.add_argument("--stage-timeout", type=nonnegative, default=900.0,
                      help="Maximum wall-clock seconds for one discovery/download stage")
+    cli.add_argument("--critical-financial-budget", type=nonnegative, default=300.0,
+                     help="Reserved wall-clock budget for annual/interim/results sources")
+    cli.add_argument("--governance-budget", type=nonnegative, default=180.0,
+                     help="Reserved wall-clock budget for governance/management sources")
+    cli.add_argument("--news-budget", type=nonnegative, default=180.0,
+                     help="Best-effort wall-clock budget for general news")
+    cli.add_argument("--deep-archive-budget", type=nonnegative, default=60.0,
+                     help="Best-effort wall-clock budget for deep archive traversal")
+    cli.add_argument("--archive-no-new-document-threshold", type=positive, default=3,
+                     help="Stop an archive route after this many low-yield pages")
     cli.add_argument("--http-timeout", type=nonnegative, default=45.0,
                      help="Overall timeout for one HTTP operation")
     cli.add_argument("--max-documents", type=positive, help="Testing only: cap downloads per category; marks truncated runs PARTIAL")

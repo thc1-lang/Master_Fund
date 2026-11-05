@@ -96,11 +96,16 @@ def test_quality_diagnostics_distinguish_extraction_failure_from_unavailable():
     assert _coverage_diagnostics(documents=[], claims=[], base=failed_base, state_rows=[], as_of_date="2026-09-25") == []
 
 
-def test_governance_completeness_diagnostic_blocks_incomplete_proxy_snapshot():
+def test_governance_completeness_diagnostic_keeps_optional_proxy_gaps_noncritical():
     docs = [{"document_id": "proxy", "ticker": "TST", "document_type": "proxy_statement", "metadata": {"sec_form": "DEF 14A"}, "text": "Election of directors; Audit Committee; independent directors."}]
     base = SimpleNamespace(management={"people_count": 4}, governance={"available": True, "board_size": 3, "committees": [], "independence": {"known_count": 0}})
     diagnostics = _coverage_diagnostics(documents=docs, claims=[], base=base, state_rows=[], as_of_date="2026-09-25")
-    assert any(item["code"] == "CRITICAL_GOVERNANCE_EXTRACTION_INCOMPLETE" for item in diagnostics)
+    # A validated board roster satisfies the minimum governance gate; missing
+    # optional committee/independence detail remains a coverage limitation.
+    assert not any(item["code"] == "CRITICAL_GOVERNANCE_EXTRACTION_INCOMPLETE" for item in diagnostics)
+    no_board = SimpleNamespace(management={"people_count": 4}, governance={"available": True, "board_size": 0, "committees": [], "independence": {"known_count": 0}})
+    blocked = _coverage_diagnostics(documents=docs, claims=[], base=no_board, state_rows=[], as_of_date="2026-09-25")
+    assert any(item["code"] == "CRITICAL_GOVERNANCE_EXTRACTION_INCOMPLETE" for item in blocked)
 
 
 def test_governance_member_independence_map_counts_as_committee_membership():

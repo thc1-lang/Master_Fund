@@ -21,6 +21,10 @@ from .compatibility import (ArtifactCompatibilityStore, CompatibilityDecision,
                             implementation_fingerprint_for)
 from management_intelligence.governance_store import GovernanceStore
 from qualitative_analysis.extraction_safety import looks_like_pdf_corruption
+from qualitative_ir_downloader.google_sheets_publisher import (
+    DEFAULT_QUALITATIVE_SPREADSHEET_ID,
+    GoogleSheetsPublisher,
+)
 
 
 MODULES = {
@@ -38,6 +42,7 @@ STAGE_ORDER = (
     "acquisition", "normalization", "qualitative_extraction", "temporal_comparison",
     "state_synthesis", "insider_intelligence", "management_intelligence",
     "management_track_record", "governance_intelligence", "scoring", "dossier_generation",
+    "google_sheets_publication",
 )
 EXIT_SUCCESS = 0
 EXIT_UNEXPECTED_FAILURE = 1
@@ -45,6 +50,7 @@ EXIT_ACQUISITION_FAILURE = 2
 EXIT_NORMALIZATION_FAILURE = 3
 EXIT_INVALID_CONFIGURATION = 4
 EXIT_QUALITY_GATE_FAILURE = 5
+EXIT_GOOGLE_SHEETS_FAILURE = 6
 STAGE_NUMBERS = {name: index for index, name in enumerate(STAGE_ORDER, start=1)}
 DEFAULT_DATA_ROOT = Path(r"C:\NAllenAI\Data\Microeconomics")
 FOLDER_NAMES = {
@@ -59,6 +65,7 @@ FOLDER_NAMES = {
     "scoring": "09_Scoring",
     "dossier": "10_Research_Dossier",
     "summaries": "11_Run_Summaries",
+    "google_sheets": "12_Google_Sheets",
 }
 
 
@@ -175,6 +182,10 @@ class PipelineRunner:
         executor: Callable[[str, list[str]], Any] | None = None,
         verbose: bool = False,
         manual_ticker: bool = False,
+        google_sheets: bool | None = None,
+        google_spreadsheet_id: str | None = None,
+        google_service_account: str | Path | None = None,
+        google_sheets_publisher: Any | None = None,
     ) -> None:
         if mode not in {"existing", "fresh"}:
             raise ValueError("mode must be 'existing' or 'fresh'")
@@ -199,6 +210,18 @@ class PipelineRunner:
         # The CLI sets this for an explicit --ticker. Batch --tickers runs
         # retain worksheet selection semantics in the acquisition component.
         self.manual_ticker = bool(manual_ticker)
+        # Direct library callers retain the historical no-external-side-effect
+        # default.  The CLI explicitly passes True unless --no-google-sheets
+        # is supplied, making publication the normal command-line behavior.
+        self.google_sheets_enabled = google_sheets is True
+        self.google_spreadsheet_id = google_spreadsheet_id or DEFAULT_QUALITATIVE_SPREADSHEET_ID
+        # Keep None when no CLI override was supplied so the publisher can
+        # apply CLI > FULL_QUAL_GOOGLE_SERVICE_ACCOUNT > default precedence.
+        self.google_service_account = Path(google_service_account) if google_service_account else None
+        self._google_sheets_publisher = google_sheets_publisher
+        self._publication_summary: dict[str, Any] = {}
+        self._google_sheets_status = "NOT_REQUESTED"
+        self._research_status = "SUCCESS"
         self.ticker_root = self.data_root / self.ticker
         self.production_dossier_root = self.ticker_root / FOLDER_NAMES["dossier"]
         self.production_pipeline_root = self.ticker_root / FOLDER_NAMES["summaries"] / "Pipeline"
@@ -232,6 +255,7 @@ class PipelineRunner:
         # runner transitive invalidation without turning every execution into
         # a rebuild.
         self._changed_stages: set[str] = set()
+        self._canonical_identity_changed = False
 
     def _safe_clean_target(self) -> None:
         root = self.data_root.expanduser().resolve(strict=False)
@@ -255,6 +279,7 @@ class PipelineRunner:
             "--ticker", self.ticker,
             "--download-root", str(self.download_root),
             "--acquisition-deadline", str(self.acquisition_timeout),
+            "--as-of-date", self.as_of_date,
         ]
         if issuer is not None:
             args.extend(["--company-name", issuer.company_name])
@@ -268,8 +293,36 @@ class PipelineRunner:
                 self.ticker,
                 download_root=self.download_root,
                 data_root=self.data_root,
+                as_of_date=self.as_of_date,
             )
         return self._issuer_metadata
+
+    def _persist_issuer_identity(self) -> None:
+        """Persist the resolved issuer identity in a ticker-scoped sidecar.
+
+        Analytical stages remain independent of the runner, but downstream
+        dossier/publisher code can consume this authoritative identity without
+        consulting a global worksheet or a previous ticker's state.
+        """
+        if self._issuer_metadata is None:
+            return
+        path = self.artifacts_root / "issuer_identity" / f"{self.ticker}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            try:
+                previous = json.loads(path.read_text(encoding="utf-8"))
+                previous_cik = str(previous.get("issuer_cik") or previous.get("sec_registrant_cik") or "").zfill(10)
+                current_cik = str(self._issuer_metadata.cik or "").zfill(10)
+                previous_hash = str(previous.get("identity_hash") or "")
+                if previous_cik and current_cik and previous_cik != current_cik:
+                    self._canonical_identity_changed = True
+                elif previous_hash and previous_hash != self._issuer_metadata.identity_hash:
+                    self._canonical_identity_changed = True
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                self._canonical_identity_changed = True
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(self._issuer_metadata.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
 
     def _mark_interrupted_acquisition(self, reason: str) -> None:
         """Close a child checkpoint when the parent had to terminate it."""
@@ -300,13 +353,16 @@ class PipelineRunner:
     def _stage_label(self, name: str) -> str:
         return name.replace("_", " ").upper()
 
+    def _stage_total(self) -> int:
+        return len(STAGE_ORDER) if self.google_sheets_enabled else len(STAGE_ORDER) - 1
+
     def _announce_start(self, name: str) -> None:
         self._current_stage = name
         self._active_stage = name
         position = STAGE_NUMBERS.get(name)
         if position is None:
             return
-        print(f"[{position}/{len(STAGE_ORDER)}] {self._stage_label(name)} — STARTED", flush=True)
+        print(f"[{position}/{self._stage_total()}] {self._stage_label(name)} — STARTED", flush=True)
         if name == "acquisition":
             print(f"Ticker: {self.ticker}", flush=True)
             print(f"Mode: {self.mode}", flush=True)
@@ -343,7 +399,7 @@ class PipelineRunner:
                 counters = progress.get("counters") or {}
                 no_progress = progress.get("no_progress_for_seconds", 0)
                 print(
-                    f"[{position}/{len(STAGE_ORDER)}] ACQUISITION "
+                    f"[{position}/{self._stage_total()}] ACQUISITION "
                     f"substage={progress.get('current_substage') or 'UNKNOWN'} "
                     f"elapsed={elapsed}s no_progress_for={int(no_progress)}s "
                     f"processed={counters.get('processed', 0)} saved={counters.get('saved', 0)} "
@@ -351,7 +407,7 @@ class PipelineRunner:
                     flush=True,
                 )
             else:
-                print(f"[{position}/{len(STAGE_ORDER)}] ACQUISITION NO_PROGRESS_FOR={elapsed}s (no checkpoint yet)", flush=True)
+                print(f"[{position}/{self._stage_total()}] ACQUISITION NO_PROGRESS_FOR={elapsed}s (no checkpoint yet)", flush=True)
 
     def _manifest_path(self) -> Path:
         return self.production_pipeline_root / f"{self.ticker}_{self.as_of_date}_pipeline_run.json"
@@ -390,6 +446,9 @@ class PipelineRunner:
             "exit_code": self._exit_code if exit_code is None else exit_code,
             "failure_stage": self._failure_stage,
             "failure_reason": self._failure_reason,
+            "research_status": self._research_status,
+            "google_sheets_status": self._google_sheets_status,
+            "google_sheets_publication": dict(self._publication_summary),
             "active_stage": self._active_stage,
             "acquisition_result": self._acquisition_result.to_dict() if self._acquisition_result else None,
             "issuer_resolution": self._issuer_metadata.to_dict() if self._issuer_metadata else None,
@@ -417,6 +476,8 @@ class PipelineRunner:
         except ValueError:
             start = 0
         for name in STAGE_ORDER[start:]:
+            if name == "google_sheets_publication" and not self.google_sheets_enabled:
+                continue
             if any(stage.name == name for stage in self._stages):
                 continue
             self._stages.append(StageResult(name=name, status=StageStatus.NOT_RUN,
@@ -432,6 +493,7 @@ class PipelineRunner:
             time.perf_counter() - self._run_started, str(self.ticker_root), "",
             self._exit_code if exit_code is None else exit_code,
             self._failure_stage, self._failure_reason,
+            self._research_status, self._google_sheets_status, dict(self._publication_summary),
         )
 
     def _finish_failure(self, stage: str, reason: str, exit_code: int) -> PipelineRunResult:
@@ -632,6 +694,25 @@ class PipelineRunner:
         selected.sort(key=lambda item: (str(item[1].get("run_timestamp") or ""), item[0].stat().st_mtime, item[0].name), reverse=True)
         return [path for path, _ in selected]
 
+    def _critical_source_handoff_complete(self) -> bool:
+        """Return whether an interrupted acquisition left a usable critical corpus.
+
+        A hard parent timeout can terminate the browser after the critical
+        annual/interim/governance/management checkpoint has been persisted.
+        In that case the cache is a valid partial handoff and analytical
+        stages should continue; broad archive incompleteness is represented as
+        a limitation rather than destroying the usable source handoff.
+        """
+        for company_dir in self._company_manifest_dirs():
+            try:
+                payload = json.loads((company_dir / "manifest.json").read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            coverage = payload.get("critical_source_coverage") or {}
+            if bool(coverage.get("minimum_research_corpus_acquired")) or str(payload.get("critical_source_coverage_status") or "") == "COMPLETE":
+                return True
+        return False
+
     def _resolve_acquisition_result(self, *, allow_local_fallback: bool | None = None) -> AcquisitionResult:
         """Resolve the current ticker's acquisition handoff from manifests.
 
@@ -727,6 +808,15 @@ class PipelineRunner:
         dedup_warnings = list(dict.fromkeys(warnings))
         latest_manifest = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
         status = str(latest_manifest.get("overall_status") or latest_manifest.get("status") or "UNKNOWN")
+        critical_coverage = latest_manifest.get("critical_source_coverage") or {}
+        if (
+            status in {"FAILED", "INTERRUPTED"}
+            and bool(critical_coverage.get("minimum_research_corpus_acquired"))
+            and (reports_records or report_paths)
+        ):
+            # Parent termination after the persisted critical checkpoint is a
+            # partial acquisition handoff, not an empty/failed source cache.
+            status = "PARTIAL"
         cache_metrics = latest_manifest.get("cache_metrics") or {}
         latest_events = latest_manifest.get("events") or []
         if isinstance(latest_events, list):
@@ -806,7 +896,7 @@ class PipelineRunner:
             stage_provenance.setdefault("input_compatibility", compatibility_action or "UNKNOWN")
             if status in {StageStatus.SUCCESS, StageStatus.PARTIAL} and compatibility_action == "REBUILD_REQUIRED":
                 stage_provenance["stage_execution_action"] = "REBUILT"
-            elif status == StageStatus.REUSED:
+            elif status in {StageStatus.REUSED, StageStatus.NO_CHANGES}:
                 stage_provenance.setdefault("stage_execution_action", "REUSED")
             else:
                 stage_provenance.setdefault("stage_execution_action", "CREATED")
@@ -898,13 +988,13 @@ class PipelineRunner:
         position = STAGE_NUMBERS.get(name)
         if position is not None and status != StageStatus.NOT_RUN:
             if status == StageStatus.FAILED:
-                print(f"[{position}/{len(STAGE_ORDER)}] {self._stage_label(name)} — FAILED", flush=True)
+                print(f"[{position}/{self._stage_total()}] {self._stage_label(name)} — FAILED", flush=True)
                 if result.message or result.warnings:
                     print(f"Reason: {result.message or '; '.join(result.warnings)}", flush=True)
             elif status == StageStatus.SKIPPED_DEPENDENCY_FAILURE:
-                print(f"[{position}/{len(STAGE_ORDER)}] {self._stage_label(name)} — SKIPPED_DEPENDENCY_FAILURE", flush=True)
+                print(f"[{position}/{self._stage_total()}] {self._stage_label(name)} — SKIPPED_DEPENDENCY_FAILURE", flush=True)
             else:
-                print(f"[{position}/{len(STAGE_ORDER)}] {self._stage_label(name)} — COMPLETE", flush=True)
+                print(f"[{position}/{self._stage_total()}] {self._stage_label(name)} — COMPLETE", flush=True)
         if self._active_stage == name:
             self._active_stage = ""
         self._write_manifest_snapshot()
@@ -934,6 +1024,12 @@ class PipelineRunner:
     def _compatibility_for(self, stage: str, *, dependency_values: dict[str, Any] | None = None) -> CompatibilityDecision:
         decision = self._compatibility.decide(stage, self.ticker, profile=self.profile, dependency_values=dependency_values)
         contract = STAGE_CONTRACTS.get(stage)
+        if self._canonical_identity_changed:
+            decision.status = "INCOMPATIBLE"
+            decision.action = "REBUILD_REQUIRED"
+            decision.reason = "CANONICAL_REGISTRANT_CHANGED"
+            if "CANONICAL_REGISTRANT_CHANGED" not in decision.diagnostics:
+                decision.diagnostics.append("CANONICAL_REGISTRANT_CHANGED")
         if self.profile != "core_v1" and contract and any(dependency in self._changed_stages for dependency in contract.dependencies):
             decision.status = "INCOMPATIBLE"
             decision.action = "REBUILD_REQUIRED"
@@ -952,6 +1048,12 @@ class PipelineRunner:
             decision.action = "REBUILD_REQUIRED"
             decision.reason = integrity_issue
             decision.diagnostics.append(integrity_issue)
+        if self._canonical_identity_changed:
+            decision.status = "INCOMPATIBLE"
+            decision.action = "REBUILD_REQUIRED"
+            decision.reason = "CANONICAL_REGISTRANT_CHANGED"
+            if "CANONICAL_REGISTRANT_CHANGED" not in decision.diagnostics:
+                decision.diagnostics.append("CANONICAL_REGISTRANT_CHANGED")
         self._compatibility_decisions[stage] = decision
         if self.verbose and self.profile != "core_v1":
             print(
@@ -1042,9 +1144,12 @@ class PipelineRunner:
         # The frozen qualitative layer reads the downloader's cache.  Keep
         # that cache outside the cleanable production tree in every mode;
         # outputs are materialized into the numbered production folders later.
-        return ["--ticker", self.ticker, "--download-root", str(self._normalization_download_root()),
+        args = ["--ticker", self.ticker, "--download-root", str(self._normalization_download_root()),
                 "--store-root", str(self.artifacts_root / "qualitative_analysis"),
-                "--as-of-date", self.as_of_date, *extra]
+                "--as-of-date", self.as_of_date]
+        if self._issuer_metadata and self._issuer_metadata.cik:
+            args.extend(["--issuer-cik", self._issuer_metadata.cik])
+        return [*args, *extra]
 
     def _normalization_download_root(self) -> Path:
         """Choose an existing validated source cache without guessing files.
@@ -1136,9 +1241,19 @@ class PipelineRunner:
                     if isinstance(candidate, dict) and ("warnings" in candidate or "status" in candidate):
                         payload = candidate
                         break
-                research_warnings = [str(item) for item in (payload or {}).get("warnings", [])]
-                if str((payload or {}).get("status") or "").upper() in {"EXTRACTION_FAILED", "PARTIAL"}:
-                    research_warnings.append(f"RESEARCH_STATUS_{str(payload.get('status')).upper()}")
+                raw_warnings = [str(item) for item in (payload or {}).get("warnings", [])]
+                # Missing optional charter/bylaw exhibits limit rights-level
+                # coverage but do not invalidate an otherwise complete proxy
+                # board extraction.  Keep source limitations visible without
+                # downgrading the governance stage itself.
+                noncritical_warnings = {
+                    "cached charter/bylaw exhibits unavailable; rights remain proxy-limited",
+                    "SOURCE_COVERAGE_INCOMPLETE",
+                }
+                research_warnings = [w for w in raw_warnings if w not in noncritical_warnings]
+                governance_status = str((payload or {}).get("status") or "").upper()
+                if governance_status in {"EXTRACTION_FAILED", "GOVERNANCE_EXTRACTION_FAILED", "GOVERNANCE_INSUFFICIENT", "PARTIAL"}:
+                    research_warnings.append(f"RESEARCH_STATUS_{governance_status}")
                 if research_warnings:
                     research_warnings = sorted(set(research_warnings))
             stage_status = StageStatus.PARTIAL if research_warnings or not sum(after.values()) else StageStatus.SUCCESS
@@ -1165,6 +1280,66 @@ class PipelineRunner:
         source_json, source_md = self._source_dossier_paths(profile_version)
         return self.production_dossier_root / source_json.name, self.production_dossier_root / source_md.name
 
+    def _publish_google_sheets(self, dossier_path: Path) -> StageResult:
+        """Publish the finalized dossier without changing analytical stores."""
+        started = time.perf_counter()
+        self._announce_start("google_sheets_publication")
+        if not dossier_path.exists():
+            self._google_sheets_status = "FAILED"
+            self._publication_summary = {"status": "FAILED", "code": "DOSSIER_NOT_AVAILABLE"}
+            return self._stage(
+                "google_sheets_publication", StageStatus.FAILED,
+                warnings=["GOOGLE_SHEETS_PUBLISH_FAILED", "DOSSIER_NOT_AVAILABLE"],
+                message="GOOGLE_SHEETS_PUBLISH_FAILED: finalized dossier is unavailable",
+                started=started, change="UPDATED",
+            )
+        publisher = self._google_sheets_publisher or GoogleSheetsPublisher(
+            spreadsheet_id=self.google_spreadsheet_id,
+            service_account=self.google_service_account,
+        )
+        try:
+            summary = publisher.publish(
+                dossier_path,
+                ticker=self.ticker,
+                as_of_date=self.as_of_date,
+                artifacts_root=self.artifacts_root,
+                production_root=self.ticker_root,
+                run_id=self._run_id,
+            )
+        except Exception as exc:
+            self._google_sheets_status = "FAILED"
+            self._publication_summary = {"status": "FAILED", "code": "GOOGLE_SHEETS_PUBLISH_FAILED", "message": str(exc)}
+            return self._stage(
+                "google_sheets_publication", StageStatus.FAILED,
+                warnings=["GOOGLE_SHEETS_PUBLISH_FAILED"], message=str(exc),
+                started=started, change="UPDATED",
+            )
+        payload = summary.to_dict() if hasattr(summary, "to_dict") else dict(summary or {})
+        self._publication_summary = payload
+        self._google_sheets_status = str(payload.get("status") or "FAILED")
+        status_text = self._google_sheets_status
+        if status_text in {"CREATED", "UPDATED"}:
+            stage_status, change = StageStatus.SUCCESS, status_text
+        elif status_text == "NO_CHANGES":
+            stage_status, change = StageStatus.NO_CHANGES, "NO_CHANGES"
+        else:
+            stage_status, change = StageStatus.FAILED, "UPDATED"
+        warnings = [] if stage_status in {StageStatus.SUCCESS, StageStatus.REUSED} else [str(payload.get("code") or "GOOGLE_SHEETS_PUBLISH_FAILED")]
+        if stage_status == StageStatus.FAILED:
+            self._exit_code = EXIT_GOOGLE_SHEETS_FAILURE
+        return self._stage(
+            "google_sheets_publication", stage_status,
+            counts={
+                "records_added": int(payload.get("records_added") or 0),
+                "records_updated": int(payload.get("records_updated") or 0),
+                "records_unchanged": int(payload.get("records_unchanged") or 0),
+                "records_stale": int(payload.get("records_stale") or 0),
+            },
+            outputs=[Path(payload["snapshot_path"])] if payload.get("snapshot_path") else [self.ticker_root / FOLDER_NAMES["google_sheets"]],
+            warnings=warnings, message=str(payload.get("message") or ""), started=started,
+            change=change, provenance={"publication": payload, "schema_version": "full-qual-sheet-v5.1", "publisher_version": "full-qual-google-sheets-v5.1"},
+        )
+
     def _run(self) -> PipelineRunResult:
         self._ensure_production_layout()
         self._manifest_ready = True
@@ -1172,6 +1347,25 @@ class PipelineRunner:
         # Acquisition is the only stage that is intentionally allowed to touch the network.
         started = time.perf_counter()
         self._announce_start("acquisition")
+        # Resolve explicit tickers before any acquisition/existing branch.  A
+        # resolution error remains an acquisition-stage failure (rather than
+        # an opaque orchestration exception) for stable CLI semantics.
+        if self.manual_ticker:
+            try:
+                self._issuer_metadata = self._resolve_manual_issuer()
+                self._persist_issuer_identity()
+            except IssuerResolutionError as exc:
+                reason = str(exc)
+                self._stage("acquisition", StageStatus.FAILED, inputs=[self.download_root],
+                            warnings=["ISSUER_RESOLUTION_FAILED"], message=reason,
+                            started=started, change="UPDATED")
+                return self._finish_failure("acquisition", reason, EXIT_ACQUISITION_FAILURE)
+        if self.manual_ticker and self.mode == "existing" and self._canonical_identity_changed:
+            reason = "REBUILD_REQUIRED: CANONICAL_REGISTRANT_CHANGED"
+            self._stage("acquisition", StageStatus.FAILED, inputs=[self.download_root],
+                        warnings=["CANONICAL_REGISTRANT_CHANGED", "REBUILD_REQUIRED"], message=reason,
+                        started=started, change="UPDATED", provenance={"reason": "CANONICAL_REGISTRANT_CHANGED"})
+            return self._finish_failure("acquisition", reason, EXIT_ACQUISITION_FAILURE)
         if self.skip_acquisition:
             self._acquisition_result = self._resolve_acquisition_result(allow_local_fallback=True)
             self._stage("acquisition", StageStatus.SKIPPED, counts=dict(self._acquisition_result.record_counts),
@@ -1216,13 +1410,17 @@ class PipelineRunner:
                 # its failure handoff.
                 self._mark_interrupted_acquisition("ACQUISITION_DEADLINE_EXCEEDED")
             acquisition_warnings = list(self._acquisition_result.warnings)
-            self._stage("acquisition", StageStatus.SUCCESS if code == 0 else StageStatus.FAILED,
+            critical_handoff = code in {2, 124} and self._critical_source_handoff_complete() and self._acquisition_result.eligible_artifacts > 0
+            acquisition_stage_status = StageStatus.SUCCESS if code == 0 else StageStatus.PARTIAL if critical_handoff else StageStatus.FAILED
+            if critical_handoff:
+                acquisition_warnings.append("ACQUISITION_DEADLINE_EXCEEDED_AFTER_CRITICAL_CORPUS")
+            self._stage("acquisition", acquisition_stage_status,
                         inputs=[self.download_root, Path(self._acquisition_result.company_acquisition_root)] if self._acquisition_result.company_acquisition_root else [self.download_root],
                         counts=dict(self._acquisition_result.record_counts),
-                        warnings=acquisition_warnings if code == 0 else ["Acquisition command failed"],
+                        warnings=acquisition_warnings if code == 0 or critical_handoff else ["Acquisition command failed"],
                         provenance=self._acquisition_result.to_dict(),
                         message=output[-500:], started=started, change="UPDATED")
-            if code != 0:
+            if code != 0 and not critical_handoff:
                 reason = output[-1000:] or f"Acquisition exited with return code {code}"
                 return self._finish_failure("acquisition", reason, EXIT_ACQUISITION_FAILURE)
 
@@ -1468,6 +1666,26 @@ class PipelineRunner:
             self._stage("validation_audit", StageStatus.SUCCESS if code == 0 else StageStatus.PARTIAL,
                         warnings=[] if code == 0 else ["Validation audit did not complete"], message=output[-500:], started=started, change="UPDATED")
 
+        # Materialize production copies before publication: the sheet consumes
+        # the same local dossier path handed to the human/AI consumers.
+        production = self._materialize_outputs()
+        analytical_stages = [stage for stage in self._stages if stage.name != "google_sheets_publication"]
+        if any(stage.status == StageStatus.FAILED for stage in analytical_stages if stage.name in {"scoring", "dossier_generation", "governance_intelligence", "management_intelligence", "management_track_record"}):
+            self._research_status = "FAILED"
+        elif any(stage.status in {StageStatus.PARTIAL, StageStatus.FAILED} for stage in analytical_stages):
+            self._research_status = "PARTIAL"
+        else:
+            self._research_status = "SUCCESS"
+        if self.google_sheets_enabled:
+            dossier_for_publication = Path(production["dossier_json"]) if production.get("dossier_json") else dossier_json
+            if dossier_stage.status in {StageStatus.SUCCESS, StageStatus.PARTIAL, StageStatus.REUSED}:
+                self._publish_google_sheets(dossier_for_publication)
+            else:
+                self._google_sheets_status = "SKIPPED"
+                self._publication_summary = {"status": "SKIPPED", "code": "DOSSIER_NOT_READY"}
+                self._stage("google_sheets_publication", StageStatus.SKIPPED,
+                            warnings=["Dossier was not ready for publication"], started=time.perf_counter(), change="REUSED")
+
         statuses = [stage.status for stage in self._stages]
         if any(stage.status == StageStatus.FAILED for stage in self._stages if stage.name in {"scoring", "dossier_generation", "governance_intelligence", "management_intelligence", "management_track_record"}):
             final = StageStatus.FAILED
@@ -1481,7 +1699,6 @@ class PipelineRunner:
                 self._exit_code = EXIT_QUALITY_GATE_FAILURE
         else:
             final = StageStatus.SUCCESS
-        production = self._materialize_outputs()
         result = self._build_result(final)
         # Keep the materialized dossier paths returned by the production copy.
         result.dossier_json = production["dossier_json"]

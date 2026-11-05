@@ -11,7 +11,7 @@ from .document_store import DocumentStore
 from .extraction_store import ExtractionStore
 from .ingestion import ingest
 from .qualitative_extraction import DeterministicExtractionProvider, extract_document
-from .temporal_comparison import DeterministicTemporalComparisonProvider, claims_available_as_of, compare_latest_vs_previous
+from .temporal_comparison import DeterministicTemporalComparisonProvider, claims_available_as_of, compare_latest_vs_previous, eligible_observed_claims
 from .temporal_store import TemporalStore
 from .state_store import StateStore
 from .state_synthesis import DeterministicStateSynthesisProvider
@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force-state", action="store_true", help="recompute stored qualitative states")
     parser.add_argument("--dry-run", action="store_true", help="normalize and report without writing the store")
     parser.add_argument("--as-of-date", help="historical cutoff for evidence admission")
+    parser.add_argument("--issuer-cik", help=argparse.SUPPRESS)
     parser.add_argument("--download-root", type=Path, default=Path.home() / "Downloads", help=argparse.SUPPRESS)
     parser.add_argument("--store-root", type=Path, default=Path("artifacts/qualitative_analysis"), help=argparse.SUPPRESS)
     return parser
@@ -105,7 +106,7 @@ def _run_extraction(args, document_store: DocumentStore) -> int:
     if args.document_type:
         documents = [d for d in documents if d.document_type == args.document_type]
     if not documents and args.ticker and not args.dry_run:
-        ingest(ticker=args.ticker, download_root=args.download_root, store=document_store, rebuild=False, document_type=args.document_type, dry_run=False)
+        ingest(ticker=args.ticker, download_root=args.download_root, store=document_store, rebuild=False, document_type=args.document_type, dry_run=False, issuer_cik=args.issuer_cik)
         documents = document_store.get_by_ticker(args.ticker)
         if args.document_type:
             documents = [d for d in documents if d.document_type == args.document_type]
@@ -245,8 +246,9 @@ def _run_comparison(args, claim_store: ExtractionStore) -> int:
     claims = claim_store.get_by_ticker(ticker)
     if args.as_of_date:
         claims = claims_available_as_of(claims, args.as_of_date)
+    eligible_claims, eligibility = eligible_observed_claims(claims, as_of_date=args.as_of_date)
     temporal_store = TemporalStore(args.store_root)
-    valid_periods = {claim.period_label for claim in claims if claim.period_label}
+    valid_periods = {claim.period_label for claim in eligible_claims if claim.period_label}
     if not args.dry_run:
         if args.force_comparison:
             # A forced analytical rebuild replaces the issuer's complete
@@ -260,8 +262,8 @@ def _run_comparison(args, claim_store: ExtractionStore) -> int:
     # the historical default; an annual comparison is materialized alongside
     # it when two completed annual periods exist.  No annual/quarterly mixing
     # or synthetic Q4 is permitted.
-    quarterly = compare_latest_vs_previous(ticker, claims, dimension=args.dimension, provider=provider, horizon="quarterly")
-    annual = compare_latest_vs_previous(ticker, claims, dimension=args.dimension, provider=provider, horizon="annual")
+    quarterly = compare_latest_vs_previous(ticker, claims, dimension=args.dimension, provider=provider, horizon="quarterly", as_of_date=args.as_of_date)
+    annual = compare_latest_vs_previous(ticker, claims, dimension=args.dimension, provider=provider, horizon="annual", as_of_date=args.as_of_date)
     result = quarterly if quarterly.status != "INSUFFICIENT_PERIODS" else annual
     summary = {
         "ticker": ticker.upper(),
@@ -283,6 +285,10 @@ def _run_comparison(args, claim_store: ExtractionStore) -> int:
         comparisons[horizon] = {
             "status": candidate.status, "from_period": candidate.from_period, "to_period": candidate.to_period,
             "available_periods": candidate.available_periods, "changes": len(candidate.changes),
+            "as_of_date": candidate.as_of_date,
+            "eligible_periods": candidate.eligible_periods,
+            "excluded_periods": candidate.excluded_periods,
+            "period_diagnostics": candidate.period_diagnostics,
         }
     summary["comparison_horizons"] = comparisons
     summary["latest_quarterly_comparison"] = {"from_period": quarterly.from_period, "to_period": quarterly.to_period, "status": quarterly.status}
@@ -312,7 +318,7 @@ def _run_comparison(args, claim_store: ExtractionStore) -> int:
         summary["changes_created"] = len(quarterly.changes) + (len(annual.changes) if annual.status != "INSUFFICIENT_PERIODS" else 0)
     if not args.dry_run:
         metadata_path = args.store_root / "temporal_comparison_metadata.json"
-        metadata_path.write_text(json.dumps({"ticker": ticker.upper(), "as_of_date": args.as_of_date, "latest_quarterly_comparison": comparisons["quarterly"], "latest_annual_comparison": comparisons["annual"]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        metadata_path.write_text(json.dumps({"ticker": ticker.upper(), "as_of_date": args.as_of_date, "eligible_periods": quarterly.eligible_periods or annual.eligible_periods, "excluded_periods": quarterly.excluded_periods + [item for item in annual.excluded_periods if item not in quarterly.excluded_periods], "period_diagnostics": quarterly.period_diagnostics, "latest_quarterly_comparison": comparisons["quarterly"], "latest_annual_comparison": comparisons["annual"]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _print_comparison(summary)
     return 0
 
@@ -362,6 +368,16 @@ def _run_state(args, claim_store: ExtractionStore) -> int:
         claims = claim_store.get_by_ticker(ticker)
         if args.as_of_date:
             claims = claims_available_as_of(claims, args.as_of_date)
+            # State synthesis must use the same observed-period PIT boundary
+            # as temporal comparison.  Keep non-observed guidance/reference
+            # claims in the input, but remove actual-period claims that cannot
+            # be proven eligible at the requested cutoff.
+            eligible_observed, _period_eligibility = eligible_observed_claims(claims, as_of_date=args.as_of_date)
+            eligible_ids = {claim.claim_id for claim in eligible_observed}
+            claims = [
+                claim for claim in claims
+                if claim.claim_id in eligible_ids or getattr(claim, "period_type", "UNKNOWN") not in {"QUARTER_ACTUAL", "ANNUAL_ACTUAL", "YTD_ACTUAL"}
+            ]
         if args.dimension:
             claims = [claim for claim in claims if claim.dimension == args.dimension]
         changes = temporal_store.get_by_ticker(ticker)
@@ -435,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_comparison(args, ExtractionStore(args.store_root))
     if args.extract:
         return _run_extraction(args, store)
-    result = ingest(ticker=args.ticker, all_companies=args.all_companies, download_root=args.download_root, store=store, rebuild=args.rebuild, replace_ticker=args.replace_ticker, document_type=args.document_type, dry_run=args.dry_run)
+    result = ingest(ticker=args.ticker, all_companies=args.all_companies, download_root=args.download_root, store=store, rebuild=args.rebuild, replace_ticker=args.replace_ticker, document_type=args.document_type, dry_run=args.dry_run, issuer_cik=args.issuer_cik)
     _print_result(result)
     return 0
 

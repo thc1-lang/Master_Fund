@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -86,7 +87,7 @@ class TemporalStore:
             with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
                 for change in ordered:
                     handle.write(json.dumps(change.to_dict(), ensure_ascii=False, sort_keys=True) + "\n")
-            os.replace(temp_path, self.changes_path)
+            self._atomic_replace(temp_path, self.changes_path)
             self._write_index(ordered)
         finally:
             if temp_path.exists():
@@ -98,6 +99,28 @@ class TemporalStore:
         for value in values:
             grouped.setdefault(str(key(value)), []).append(value.change_id)
         return grouped
+
+    @staticmethod
+    def _atomic_replace(source: Path, target: Path, *, attempts: int = 6) -> None:
+        """Replace a JSON store atomically, tolerating transient Windows locks.
+
+        Windows antivirus/indexing and short-lived readers can briefly deny a
+        rename even though both files are valid and within the same directory.
+        A bounded retry preserves atomic replacement without weakening the
+        failure signal for a persistent permission problem.
+        """
+        last_error: PermissionError | None = None
+        for attempt in range(attempts):
+            try:
+                os.replace(source, target)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+        if last_error is not None:  # pragma: no cover - defensive
+            raise last_error
 
     def _write_index(self, values: list[TemporalChange]) -> None:
         index = {
@@ -116,7 +139,7 @@ class TemporalStore:
         temp_path = Path(temp_name)
         try:
             temp_path.write_text(json.dumps(index, indent=2, sort_keys=True), encoding="utf-8")
-            os.replace(temp_path, self.index_path)
+            self._atomic_replace(temp_path, self.index_path)
         finally:
             if temp_path.exists():
                 temp_path.unlink()

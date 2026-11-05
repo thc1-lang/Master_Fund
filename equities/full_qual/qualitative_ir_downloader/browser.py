@@ -22,6 +22,7 @@ class Browser:
         self.accessible_hosts: set[str] = set()
         self.access_events: list[AccessEvent] = []
         self.navigation_status: dict[str, int | None] = {}
+        self._consent_handled_contexts: set[int] = set()
 
     async def __aenter__(self):
         self.driver = await async_playwright().start()
@@ -45,6 +46,7 @@ class Browser:
         self.accessible_hosts.clear()
         self.access_events.clear()
         self.navigation_status.clear()
+        self._consent_handled_contexts.clear()
         if not self.browser or not self.browser.is_connected():
             self.browser = await self.driver.chromium.launch(headless=True)
         context = await self.browser.new_context(accept_downloads=True, service_workers="block")
@@ -156,14 +158,42 @@ class Browser:
             raise CollectionError("SITE_BLOCKED", f"Access challenge at {page.url}")
 
     async def dismiss_cookies(self, page: Page) -> None:
-        for name in ("Reject all", "Reject optional cookies", "Only necessary", "Accept all cookies", "Accept All"):
-            control = page.get_by_role("button", name=name, exact=True)
-            if await control.count() and await control.first.is_visible():
-                try:
-                    await control.first.click(timeout=2000)
+        context_key = id(page.context)
+        if context_key in self._consent_handled_contexts:
+            return
+        selectors = (
+            "#onetrust-reject-all-handler", "#onetrust-pc-sdk button[aria-label*='Reject']",
+            "#CybotCookiebotDialogBodyButtonDecline", "[data-testid*='reject'][data-testid*='cookie']",
+            "button:has-text('Reject all')", "button:has-text('Reject optional')",
+            "button:has-text('Only necessary')", "button:has-text('Accept all cookies')",
+            "button:has-text('Accept All')",
+        )
+        names = ("Reject all", "Reject optional cookies", "Only necessary", "Accept all cookies", "Accept All")
+        for selector in selectors:
+            try:
+                control = page.locator(selector).first
+                if await control.count() and await control.is_visible():
+                    try:
+                        await control.click(timeout=2000)
+                    except Exception:
+                        await control.click(timeout=2000, force=True)
+                    self._consent_handled_contexts.add(context_key)
                     return
-                except Exception as exc:
-                    log.debug("Cookie dismissal failed: %s", exc)
+            except Exception as exc:
+                log.debug("Cookie selector dismissal failed: %s", exc)
+        for name in names:
+            try:
+                control = page.get_by_role("button", name=name, exact=True).first
+                if await control.count() and await control.is_visible():
+                    try:
+                        await control.click(timeout=2000)
+                    except Exception:
+                        await control.click(timeout=2000, force=True)
+                    self._consent_handled_contexts.add(context_key)
+                    return
+            except Exception as exc:
+                log.debug("Cookie dismissal failed: %s", exc)
+        self._consent_handled_contexts.add(context_key)
 
 async def links(page: Page, content_only: bool = False) -> list[Link]:
     records = await page.locator("a[href]").evaluate_all("""(els, contentOnly) => els.filter(e => !contentOnly || (!e.closest('nav, header, footer, [role=navigation]') || e.closest('[aria-label*=agination], [class*=pagination], [class*=pager]'))).map(e => ({

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pipeline_runner.compatibility import (
     ArtifactCompatibilityStore,
     STAGE_CONTRACTS,
+    _atomic_replace_with_retry,
     implementation_fingerprint_for,
 )
 from pipeline_runner.main import build_parser
@@ -15,6 +18,80 @@ from pipeline_runner.runner import PipelineRunner
 
 
 class SemanticInvalidationTests(unittest.TestCase):
+    def test_atomic_replace_retries_permission_once_and_writes_complete_json(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+            root_path = Path(root)
+            source = root_path / "source.tmp"
+            destination = root_path / "artifact_compatibility.json"
+            source.write_text('{"stages": {"x": {"status": "ACTIVE"}}}\n', encoding="utf-8")
+            real_replace = __import__("pipeline_runner.compatibility", fromlist=["os"]).os.replace
+            calls = {"count": 0}
+
+            def flaky_replace(src, dst):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise PermissionError(5, "access denied")
+                return real_replace(src, dst)
+
+            with patch("pipeline_runner.compatibility.os.replace", side_effect=flaky_replace), patch("pipeline_runner.compatibility.time.sleep") as pause:
+                _atomic_replace_with_retry(source, destination)
+            self.assertEqual(calls["count"], 2)
+            self.assertEqual(json.loads(destination.read_text(encoding="utf-8"))["stages"]["x"]["status"], "ACTIVE")
+            self.assertFalse(source.exists())
+            pause.assert_called_once()
+
+    def test_atomic_replace_retries_three_failures_then_succeeds(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+            source = Path(root) / "source.tmp"
+            destination = Path(root) / "destination.json"
+            source.write_text("{}", encoding="utf-8")
+            real_replace = __import__("pipeline_runner.compatibility", fromlist=["os"]).os.replace
+            calls = {"count": 0}
+
+            def flaky_replace(src, dst):
+                calls["count"] += 1
+                if calls["count"] <= 3:
+                    raise PermissionError(5, "sharing contention")
+                return real_replace(src, dst)
+
+            with patch("pipeline_runner.compatibility.os.replace", side_effect=flaky_replace), patch("pipeline_runner.compatibility.time.sleep") as pause:
+                _atomic_replace_with_retry(source, destination)
+            self.assertEqual(calls["count"], 4)
+            self.assertEqual(pause.call_count, 3)
+            self.assertTrue(destination.exists())
+
+    def test_atomic_replace_persistent_permission_error_propagates_after_bound(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+            source = Path(root) / "source.tmp"
+            destination = Path(root) / "destination.json"
+            source.write_text("{}", encoding="utf-8")
+            with patch("pipeline_runner.compatibility.os.replace", side_effect=PermissionError(5, "locked")) as replace, patch("pipeline_runner.compatibility.time.sleep") as pause:
+                with self.assertRaises(PermissionError):
+                    _atomic_replace_with_retry(source, destination)
+            self.assertEqual(replace.call_count, 6)
+            self.assertEqual(pause.call_count, 5)
+
+    def test_atomic_replace_non_transient_error_is_not_retried(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+            source = Path(root) / "source.tmp"
+            destination = Path(root) / "destination.json"
+            source.write_text("{}", encoding="utf-8")
+            error = OSError("invalid path")
+            with patch("pipeline_runner.compatibility.os.replace", side_effect=error) as replace, patch("pipeline_runner.compatibility.time.sleep") as pause:
+                with self.assertRaisesRegex(OSError, "invalid path"):
+                    _atomic_replace_with_retry(source, destination)
+            self.assertEqual(replace.call_count, 1)
+            pause.assert_not_called()
+
+    def test_store_cleans_temporary_file_after_persistent_replace_failure(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+            store = ArtifactCompatibilityStore(Path(root))
+            with patch("pipeline_runner.compatibility.os.replace", side_effect=PermissionError(5, "locked")), patch("pipeline_runner.compatibility.time.sleep"):
+                with self.assertRaises(PermissionError):
+                    store.record("normalization", "MSFT")
+            self.assertEqual(list(Path(root).glob("artifact-compatibility-*.tmp")), [])
+            self.assertFalse(store.path.exists())
+
     def test_old_implementation_fingerprint_requires_rebuild(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
             store = ArtifactCompatibilityStore(Path(root))

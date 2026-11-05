@@ -45,6 +45,16 @@ class IssuerIdentity:
     company_name: str
     issuer_cik: str
     source_url: str
+    exchange: str | None = None
+    security_title: str | None = None
+    sec_registrant_cik: str | None = None
+    sec_registrant_name: str | None = None
+    historical_registrant_names: list[str] = field(default_factory=list)
+    successor_predecessor_links: list[dict[str, Any]] = field(default_factory=list)
+    corporate_action_status: str = "UNCHANGED"
+    effective_date: str | None = None
+    identity_confidence: str = "HIGH"
+    lineage_version: str = "issuer-lineage-v1"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

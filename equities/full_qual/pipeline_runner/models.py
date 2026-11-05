@@ -12,6 +12,7 @@ class StageStatus(str, Enum):
     NOT_RUN = "NOT_RUN"
     PARTIAL = "PARTIAL"
     FAILED = "FAILED"
+    NO_CHANGES = "NO_CHANGES"
     SKIPPED_DEPENDENCY_FAILURE = "SKIPPED_DEPENDENCY_FAILURE"
 
 
@@ -111,6 +112,9 @@ class PipelineRunResult:
     exit_code: int = 0
     failure_stage: str = ""
     failure_reason: str = ""
+    research_status: str = "SUCCESS"
+    google_sheets_status: str = "NOT_REQUESTED"
+    publication_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,4 +134,7 @@ class PipelineRunResult:
             "exit_code": self.exit_code,
             "failure_stage": self.failure_stage,
             "failure_reason": self.failure_reason,
+            "research_status": self.research_status,
+            "google_sheets_status": self.google_sheets_status,
+            "publication_summary": dict(self.publication_summary),
         }

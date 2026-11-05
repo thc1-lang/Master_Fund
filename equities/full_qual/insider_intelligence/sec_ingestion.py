@@ -31,6 +31,7 @@ from .source_registry import SourceRegistry
 SEC_DATA = "https://data.sec.gov"
 SEC_ARCHIVES = "https://www.sec.gov/Archives/edgar/data"
 SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
+SEC_TICKERS_EXCHANGE = "https://www.sec.gov/files/company_tickers_exchange.json"
 SEC_USER_AGENT = "Allen & Cooper Insider Intelligence nicholaslallen1@gmail.com"
 SEC_ACCEPT = "application/json,text/xml,application/xml,text/html,*/*"
 SEC_ACCEPT_ENCODING = "gzip, deflate"
@@ -266,8 +267,32 @@ class SECSourceProvider:
         if not matches:
             raise LookupError(f"SEC issuer not found for ticker {symbol}")
         item = matches[0]
+        # A stale company_tickers cache can briefly point at a related
+        # holding/company-action entity.  When the selected name signals that
+        # ambiguity, consult SEC's security-level ticker/exchange registry;
+        # ordinary issuers retain the single-request legacy path.
+        security_item = None
+        if re.search(r"\b(?:holding|holdings|subsidiary|acquisition|merger)\b", str(item.get("title") or item.get("name") or ""), re.I):
+            try:
+                exchange_cache = self.cache_root / "company_tickers_exchange.json"
+                exchange_payload = self._json(SEC_TICKERS_EXCHANGE, cache_path=exchange_cache, force=force)
+                rows = exchange_payload.get("data") if isinstance(exchange_payload, dict) and isinstance(exchange_payload.get("data"), list) else exchange_payload
+                if isinstance(rows, list):
+                    security_item = next((row for row in rows if isinstance(row, dict) and str(row.get("ticker") or "").upper() == symbol), None)
+            except Exception:
+                security_item = None
+        if isinstance(security_item, dict) and (security_item.get("cik") or security_item.get("cik_str")):
+            item = security_item
         cik = normalize_cik(item.get("cik_str") or item.get("cik"))
-        return IssuerIdentity(symbol, str(item.get("title") or item.get("name") or symbol), cik, SEC_TICKERS)
+        name = str(item.get("title") or item.get("name") or symbol)
+        return IssuerIdentity(
+            symbol, name, cik, SEC_TICKERS_EXCHANGE if security_item else SEC_TICKERS,
+            exchange=str(item.get("exchange") or "") or None,
+            security_title=str(item.get("security_title") or item.get("securityTitle") or "") or None,
+            sec_registrant_cik=cik,
+            sec_registrant_name=name,
+            identity_confidence="HIGH" if security_item else "MEDIUM",
+        )
 
     @staticmethod
     def _date_allowed(value: str | None, from_date: str | None, to_date: str | None) -> bool:

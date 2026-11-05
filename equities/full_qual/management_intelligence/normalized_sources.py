@@ -18,7 +18,7 @@ from pypdf import PdfReader
 from insider_intelligence.models import SECFiling
 
 
-_FORMS = {"DEF 14A", "DEFA14A", "10-K", "10-Q", "8-K", "8-K/A"}
+_FORMS = {"DEF 14A", "DEFA14A", "10-K", "10-Q", "20-F", "6-K", "8-K", "8-K/A"}
 
 
 def _accession(value: str | None, url: str | None) -> str | None:
@@ -52,7 +52,7 @@ def _form(metadata: dict, title: str, source_url: str) -> str | None:
     if "proxy" in document_type or "def 14a" in document_type or "annual meeting" in document_type:
         return "DEF 14A"
     combined = " ".join((title, source_url)).upper()
-    for form in ("DEF 14A", "DEFA14A", "10-K", "10-Q", "8-K/A", "8-K"):
+    for form in ("DEF 14A", "DEFA14A", "20-F", "10-K", "10-Q", "6-K", "8-K/A", "8-K"):
         if form in combined or form.replace("-", "") in combined:
             return form
     if "PROXY STATEMENT" in combined or "ANNUAL MEETING" in combined:

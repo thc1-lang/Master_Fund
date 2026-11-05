@@ -70,10 +70,10 @@ def sec_form_type(metadata: dict[str, Any], title: str, path: str | None = None)
     explicit = metadata.get("sec_form") or metadata.get("form_type") or metadata.get("form")
     if explicit:
         value = str(explicit).upper().strip()
-        if value in {"DEF 14A", "DEFA14A", "10-K", "10-Q", "8-K", "8-K/A"}:
+        if value in {"DEF 14A", "DEFA14A", "10-K", "10-Q", "20-F", "6-K", "8-K", "8-K/A"}:
             return value
     combined = " ".join((title or "", path or "", str(metadata.get("source_url") or ""))).upper()
-    for form in ("DEF 14A", "DEFA14A", "10-K", "10-Q", "8-K/A", "8-K"):
+    for form in ("DEF 14A", "DEFA14A", "20-F", "10-K", "10-Q", "6-K", "8-K/A", "8-K"):
         if form in combined or form.replace("-", "") in combined:
             return form
     return None
@@ -97,8 +97,19 @@ def classify_document(metadata: dict[str, Any], title: str, path: str | None = N
         return "other_report", form or None
     if "news" in category or "news release" in combined or "press release" in combined:
         return "news_release", None
-    if "annual" in combined or "10-k" in combined or "10k" in combined:
+    if "annual" in combined or "10-k" in combined or "10k" in combined or "20-f" in combined or "20f" in combined:
         return "annual_report", form or None
+    # Form 6-K is a container. Only result-bearing/interim content earns a
+    # period-bearing classification; generic governance/current disclosures
+    # remain other_report so they cannot manufacture a quarter.
+    if form == "6-K":
+        governance_words = r"annual general meeting|\bAGM\b|board of directors|committee|governance|appointed|stepped down|resigned|retired"
+        if re.search(governance_words, combined, re.I) or re.search(governance_words, str(metadata.get("description") or ""), re.I):
+            return "other_report", "OTHER_6K"
+        result_words = r"results|half[- ]year|interim|trading update|financial results|quarterly"
+        if re.search(result_words, combined, re.I) or re.search(result_words, str(metadata.get("description") or ""), re.I):
+            return "quarterly_report", "RESULTS_6K"
+        return "other_report", "OTHER_6K"
     if "quarterly" in combined or "10-q" in combined or "10q" in combined or (category in {"reports", "report"} and re.search(r"\bQ[1-4]\b", title, re.I)):
         return "quarterly_report", form or None
     if "presentation" in combined or "investor deck" in combined or "slides" in combined:

@@ -79,8 +79,9 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_document_failure_does_not_stop_reports(self):
         with tempfile.TemporaryDirectory() as temp:
             browser = FakeBrowser(Path(temp))
-            archive = [ArchiveResult([Document("Broken release", None, "https://ir.acme.com/news/one", "news")]),
-                       ArchiveResult([Document("Annual report", "2025", "https://ir.acme.com/report.pdf", "reports", "https://ir.acme.com/report.pdf")])]
+            # Critical reports are intentionally scheduled before general news.
+            archive = [ArchiveResult([Document("Annual report", "2025", "https://ir.acme.com/report.pdf", "reports", "https://ir.acme.com/report.pdf")]),
+                       ArchiveResult([Document("Broken release", None, "https://ir.acme.com/news/one", "news")])]
             good = Document("Annual report", "2025", "https://ir.acme.com/report.pdf", "reports", "https://ir.acme.com/report.pdf", "Reports/report.pdf", "original_pdf")
             with patch("qualitative_ir_downloader.main.IRDiscovery") as discovery, patch("qualitative_ir_downloader.main.find_news_section", AsyncMock(return_value=["https://ir.acme.com/news"])), patch("qualitative_ir_downloader.main.find_reports_section", AsyncMock(return_value=["https://ir.acme.com/reports"])), patch("qualitative_ir_downloader.main.ArchiveCrawler") as crawler, patch("qualitative_ir_downloader.main.Downloader") as downloader:
                 discovery.return_value.candidates = []
@@ -89,7 +90,7 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 discovery.return_value.errors = []
                 discovery.return_value.discover_investor_relations_site = AsyncMock(return_value=IRCandidate("https://ir.acme.com/", 95, official=True, access=AccessResult(browser_accessible=True), content_validated=True))
                 crawler.return_value.collect = AsyncMock(side_effect=archive)
-                downloader.return_value.save = AsyncMock(side_effect=[RuntimeError("failed release"), good])
+                downloader.return_value.save = AsyncMock(side_effect=[good, RuntimeError("failed release")])
                 result = await process_company(browser, Stock("ACME", "Acme", "Safe", 4), "2026-09-06_11-00-00")
             self.assertEqual(result["status"], "PARTIAL")
             self.assertEqual(result["failed_downloads"], 1)

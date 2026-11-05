@@ -15,6 +15,37 @@ log = logging.getLogger(__name__)
 PAGING = re.compile(r"^(?:next(?: page)?|older(?: (?:releases|news|posts))?|[>\u00bb\u203a]+|page \d+|\d{1,4}|view all(?: news| reports| releases)?|see all|(?:news |reports? |press release )?archive)$", re.I)
 MORE = re.compile(r"^(?:load|show|view) more(?: .*?)?$|^more (?:releases|reports)$|^older (?:releases|news)$|^next(?: page)?$|^[>\u00bb\u203a]+$", re.I)
 PROVIDERS = ("businesswire.com", "globenewswire.com", "prnewswire.com")
+_CONTROL_REJECT = re.compile(r"cookie|consent|share\s*price|lse|nasdaq|nyse|exchange|footer|navigation|social|subscribe|menu|search", re.I)
+_CONTROL_ALLOW = re.compile(r"^(?:19|20)\d{2}$|next|older|previous|page\s*\d+|load\s*more|show\s*more|view\s*more|annual|interim|quarterly|report|result|presentation|financial|regulatory|news|press|esg|sustainability", re.I)
+
+
+def archive_low_yield_stop(consecutive_pages: int, threshold: int) -> bool:
+    """Whether an archive route has reached its configurable yield bound."""
+    return int(consecutive_pages) >= max(1, int(threshold))
+
+
+def control_kind(label: str, *, role: str = "", expanded: str | None = None) -> str:
+    """Classify archive controls before any interaction is attempted."""
+    text = " ".join(str(label or "").split())
+    if not text or _CONTROL_REJECT.search(text):
+        return "REJECTED_UNRELATED"
+    if re.fullmatch(r"(?:19|20)\d{2}", text):
+        return "YEAR_FILTER"
+    # Bare numeric controls are commonly page-number indicators or footer
+    # widgets.  Their links are still harvested by ``harvest`` when they
+    # carry an href, but clicking a non-navigating ``1``/``2`` button can
+    # stall an archive traversal indefinitely.
+    if re.fullmatch(r"\d{1,4}", text):
+        return "REJECTED_UNRELATED"
+    if MORE.fullmatch(text) or PAGING.fullmatch(text):
+        return "NEXT_PAGE" if PAGING.fullmatch(text) else "LOAD_MORE"
+    if _CONTROL_ALLOW.search(text) and (role.casefold() in {"tab", "option", "button", ""} or expanded == "false"):
+        if re.search(r"presentation", text, re.I):
+            return "PRESENTATION_TAB"
+        if re.search(r"result|financial", text, re.I):
+            return "RESULTS_TAB"
+        return "REPORT_CATEGORY"
+    return "REJECTED_UNRELATED"
 
 class ArchiveCrawler:
     def __init__(self, browser: Browser, scope: Scope):
@@ -27,6 +58,8 @@ class ArchiveCrawler:
         queue = deque(dict.fromkeys(seeds))
         seen_pages, seen_docs = set(), set()
         interactions = 0
+        low_yield_pages = 0
+        low_yield_threshold = max(1, int(getattr(self.browser.config, "archive_no_new_document_threshold", 3)))
         page = await context.new_page()
 
         def issue(code, message, url=None):
@@ -107,7 +140,7 @@ class ArchiveCrawler:
                 for index in range(await controls.count()):
                     control = controls.nth(index)
                     label = (await control.inner_text() or await control.get_attribute("value") or await control.get_attribute("aria-label") or "").strip()
-                    if MORE.fullmatch(label) and await control.is_visible() and await control.is_enabled() and await control.get_attribute("aria-disabled") != "true":
+                    if control_kind(label) in {"LOAD_MORE", "NEXT_PAGE"} and await control.is_visible() and await control.is_enabled() and await control.get_attribute("aria-disabled") != "true":
                         if interactions >= self.browser.config.max_interactions:
                             issue("SAFETY_LIMIT_REACHED", "Dynamic interaction limit", page.url)
                             return
@@ -134,8 +167,9 @@ class ArchiveCrawler:
                 c = controls.nth(index)
                 label = (await c.inner_text()).strip()
                 expanded = await c.get_attribute("aria-expanded")
-                if re.fullmatch(r"(?:19|20)\d{2}", label) or await c.get_attribute("role") == "tab" or expanded == "false" or await c.evaluate("e => e.tagName === 'SUMMARY'"):
-                    if label and len(label) < 100 and not re.search(r"cookie|menu|search|subscribe", label, re.I):
+                role = await c.get_attribute("role") or ""
+                if control_kind(label, role=role, expanded=expanded) != "REJECTED_UNRELATED":
+                    if label and len(label) < 100:
                         labels.append(label)
             for label in dict.fromkeys(labels):
                 if interactions >= self.browser.config.max_interactions:
@@ -167,6 +201,7 @@ class ArchiveCrawler:
                 url = queue.popleft()
                 if url in seen_pages:
                     continue
+                page_documents_before = len(seen_docs)
                 seen_pages.add(url)
                 result.pages += 1
                 try:
@@ -204,6 +239,13 @@ class ArchiveCrawler:
                             issue(getattr(exc, "code", "ARCHIVE_CONTROL_FAILED"), str(exc), url)
                 except Exception as exc:
                     issue(getattr(exc, "code", "ARCHIVE_PAGE_FAILED"), str(exc), url)
+                if len(seen_docs) == page_documents_before:
+                    low_yield_pages += 1
+                else:
+                    low_yield_pages = 0
+                if archive_low_yield_stop(low_yield_pages, low_yield_threshold):
+                    issue("ARCHIVE_LOW_YIELD_STOP", f"Stopped after {low_yield_pages} consecutive pages with no new relevant documents", url)
+                    break
             if not result.documents:
                 issue("NO_DOCUMENTS_FOUND", f"No {category} documents recognized in selected archive")
             log.info("Found %s unique %s documents across %s archive pages", len(result.documents), category, result.pages)

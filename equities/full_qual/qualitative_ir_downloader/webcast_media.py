@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -40,15 +41,15 @@ def validate_duration(duration,config):
     if duration>config.max_duration:raise CollectionError("SAFETY_LIMIT_REACHED","Media duration exceeds configured limit")
 
 async def run_ffmpeg(config,args):
-    process=await asyncio.create_subprocess_exec(ffmpeg_path(config),"-hide_banner","-nostdin","-y",*args,stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.PIPE)
+    command=[ffmpeg_path(config),"-hide_banner","-nostdin","-y",*args]
     try:
-        _,stderr=await asyncio.wait_for(process.communicate(),config.process_timeout)
-    except asyncio.TimeoutError as exc:
-        process.kill();await process.wait()
+        result=await asyncio.wait_for(asyncio.to_thread(subprocess.run, command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False, timeout=float(config.process_timeout)), config.process_timeout + 1.0)
+    except subprocess.TimeoutExpired as exc:
         raise CollectionError("MEDIA_TIMEOUT", f"FFmpeg exceeded {config.process_timeout}s") from exc
-    except asyncio.CancelledError:
-        process.kill();await process.wait();raise
-    if process.returncode:raise CollectionError("MEDIA_DOWNLOAD_FAILED",safe_text(stderr.decode("utf-8","replace")[-1200:]))
+    except asyncio.TimeoutError as exc:
+        raise CollectionError("MEDIA_TIMEOUT", f"FFmpeg exceeded {config.process_timeout}s") from exc
+    if result.returncode:
+        raise CollectionError("MEDIA_DOWNLOAD_FAILED",safe_text(result.stderr.decode("utf-8","replace")[-1200:]))
 
 class MediaAcquirer:
     def __init__(self,context,config,folder):
@@ -218,8 +219,13 @@ class MediaAcquirer:
     async def acquire(self,candidate):
         acquisition_started=time.perf_counter()
         log.info("FFmpeg executable: %s",ffmpeg_path(self.config))
-        version=await asyncio.create_subprocess_exec(ffmpeg_path(self.config),"-version",stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
-        output,_=await asyncio.wait_for(version.communicate(),30)
+        try:
+            version=await asyncio.wait_for(asyncio.to_thread(subprocess.run, [ffmpeg_path(self.config),"-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=30), 31)
+        except subprocess.TimeoutExpired as exc:
+            raise CollectionError("MEDIA_TIMEOUT", "FFmpeg version check exceeded 30s") from exc
+        except asyncio.TimeoutError as exc:
+            raise CollectionError("MEDIA_TIMEOUT", "FFmpeg version check exceeded 30s") from exc
+        output=version.stdout
         if version.returncode:raise CollectionError("DEPENDENCY_MISSING","FFmpeg version check failed")
         log.info("FFmpeg: %s",output.decode("utf-8",errors="replace").splitlines()[0])
         self.credential_host=urlsplit(candidate.url).hostname

@@ -61,16 +61,74 @@ def is_report_candidate(document: Document | Mapping) -> bool:
 def report_document_type(document: Document | Mapping) -> str:
     title = str(document.title if isinstance(document, Document) else document.get("title") or "")
     source = str(document.source_url if isinstance(document, Document) else document.get("source_url") or "")
-    text = f"{title} {source}".lower()
+    resolved = str(document.resolved_document_url if isinstance(document, Document) else document.get("resolved_document_url") or "")
+    hint = str(document.document_type_hint if isinstance(document, Document) else document.get("document_type_hint") or "")
+    if isinstance(document, Document):
+        provenance = document.provenance or []
+    else:
+        provenance = document.get("provenance") or []
+    forms = " ".join(
+        str(item.get("form_type") or item.get("sec_form") or "")
+        for item in provenance
+        if isinstance(item, Mapping)
+    )
+    text = f"{title} {source} {resolved} {hint} {forms}".lower()
+    # Foreign private issuers use 20-F for the annual filing and 6-K for
+    # current reports.  Keep the form evidence in classification without
+    # pretending that every 6-K is an interim financial statement.
+    if re.search(r"\b20[- ]?f\b", text):
+        return "annual_report"
+    if re.search(r"\b6[- ]?k\b", text):
+        if re.search(r"interim|half[- ]year|halfyear|quarter|results", text):
+            return "interim_report"
+        if re.search(r"trading", text):
+            return "trading_update"
     for label, pattern in (
         ("annual_report", r"annual"),
+        ("interim_report", r"interim|half[- ]year|halfyear"),
         ("quarterly_report", r"quarterly|q[1-4](?:\b|[-_])"),
-        ("presentation", r"presentation|investor[- ]?deck|business update"),
-        ("sustainability_report", r"sustainability|esg"),
+        ("trading_update", r"trading update|trading"),
+        ("investor_presentation", r"presentation|investor[- ]?deck|business update|results deck"),
+        ("earnings_transcript", r"transcript"),
+        ("governance_report", r"governance|proxy|agm|board"),
+        ("ESG_report", r"sustainability|esg"),
     ):
         if re.search(pattern, text, re.I):
             return label
-    return "report_document"
+    return "other_report"
+
+
+def report_coverage_diagnostics(records: Iterable[Mapping], *, discovered: int | None = None) -> dict:
+    """Separate raw report volume from usable and critical-source coverage."""
+    rows = list(records or [])
+    metrics = report_metrics(rows, discovered=discovered)
+    usable = sum(
+        record.get("status") in {"DOWNLOADED", "CACHED", "REUSED"}
+        and not (record.get("status") == "DOWNLOADED" and record.get("duplicate_of"))
+        for record in rows
+    )
+    raw = metrics["reports_discovered"]
+    rate = usable / raw if raw else 0.0
+    types = {report_document_type(record) for record in rows if record.get("status") in {"DOWNLOADED", "CACHED", "REUSED"}}
+    critical = {
+        "latest_annual": "annual_report" in types,
+        "latest_interim": bool(types & {"interim_report", "quarterly_report"}),
+        "trading_update": "trading_update" in types,
+        "results_presentation": "investor_presentation" in types,
+        "governance_source": "governance_report" in types,
+    }
+    severe = bool(raw >= 10 and (rate < 0.5 or metrics["reports_failed"] + metrics["reports_blocked"] >= raw * 0.5))
+    limitations = ["REPORT_DOWNLOAD_COVERAGE_CRITICAL"] if severe else []
+    return {
+        "raw_report_candidates": raw,
+        "resolved_document_targets": sum(bool(record.get("resolved_document_url")) for record in rows),
+        "downloaded_reports": usable,
+        "failed_reports": metrics["reports_failed"],
+        "success_rate": rate,
+        "critical_financial_report_coverage": critical,
+        "critical_financial_report_coverage_complete": all(critical.values()),
+        "limitations": limitations,
+    }
 
 
 def failure_stage(code: str | None, message: str = "", document: Document | Mapping | None = None) -> str:

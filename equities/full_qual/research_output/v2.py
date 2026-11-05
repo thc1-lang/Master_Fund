@@ -15,6 +15,7 @@ from qualitative_analysis.risk_catalyst import extract_catalysts, extract_risks,
 
 from .assembler import assemble_dossier
 from pipeline_runner.compatibility import ArtifactCompatibilityStore, canonical_artifact_fingerprint
+from pipeline_runner.issuer_resolution import canonical_identity_hash
 from .v2_models import AnalystHandoff, InstitutionalDossier, quality_gate_from_records
 from .v2_engines import (
     build_business_quality,
@@ -91,6 +92,10 @@ def _sec_form(row: Mapping[str, Any]) -> str:
         return "10-K"
     if re.search(r"\b10-Q\b|10Q", text, re.I):
         return "10-Q"
+    if re.search(r"\b20-F\b|20F", text, re.I):
+        return "20-F"
+    if re.search(r"\b6-K\b|6K", text, re.I):
+        return "6-K"
     return ""
 
 
@@ -101,7 +106,7 @@ def _period_end(row: Mapping[str, Any]) -> str:
 def _coverage_diagnostics(*, documents: list[dict[str, Any]], claims: list[dict[str, Any]], base: Any, state_rows: list[dict[str, Any]], temporal_rows: list[dict[str, Any]] | None = None, as_of_date: str) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     sec_docs = [row for row in documents if _sec_form(row)]
-    management_docs = [row for row in sec_docs if _sec_form(row) in {"DEF 14A", "10-K", "10-Q", "8-K"}]
+    management_docs = [row for row in sec_docs if _sec_form(row) in {"DEF 14A", "10-K", "10-Q", "20-F", "6-K", "8-K"} or str(row.get("document_type") or "").lower() in {"annual_report", "governance_report", "remuneration_report"}]
     proxy_docs = [row for row in sec_docs if _sec_form(row) == "DEF 14A"]
     people_count = int(base.management.get("people_count") or 0)
     if management_docs and people_count == 0:
@@ -123,7 +128,11 @@ def _coverage_diagnostics(*, documents: list[dict[str, Any]], claims: list[dict[
             # as an empty committee.
             return bool(item.get("members") or item.get("member_ids") or item.get("member_independence"))
 
-        if has_proxy_headings and (board_size == 0 or not committees or any(not committee_has_members(item) for item in committees) or int(independence.get("known_count") or 0) == 0):
+        # A validated board roster is the minimum governance gate.  Committee
+        # shells with undisclosed/unparsed memberships are retained as an
+        # explicit coverage limitation, but optional committee detail must not
+        # turn an otherwise usable proxy into a critical extraction failure.
+        if has_proxy_headings and board_size == 0:
             diagnostics.append({"code": "CRITICAL_GOVERNANCE_EXTRACTION_INCOMPLETE", "module": "governance_intelligence", "severity": "CRITICAL", "reason": "The proxy contains director or committee evidence but the governance snapshot is materially incomplete.", "required_action": "Repair proxy classification/routing/extraction and rebuild governance."})
     bad_guidance = [row for row in claims if str(row.get("dimension") or "") == "guidance" and not row.get("guidance_subtype") and re.search(r"director|board|shareholder|committee|governance|legal|risk|analyst|third[- ]party", str(row.get("evidence_text") or row.get("claim_text") or ""), re.I)]
     if bad_guidance:
@@ -372,6 +381,10 @@ def assemble_institutional_dossier(
             "source_status": row.get("source_status") or "UNKNOWN",
             "membership_status": row.get("membership_status") or "UNKNOWN",
             "source_accession": row.get("source_accession"), "source_date": row.get("source_date"),
+            "source_filed_at": row.get("source_filed_at"), "source_period": row.get("source_period"),
+            "as_of_eligibility": row.get("as_of_eligibility") or "ELIGIBLE",
+            "source_url": row.get("source_url"), "local_source_path": row.get("local_source_path"),
+            "normalized_document_id": row.get("normalized_document_id"),
             "source_record_ids": [str(row.get("committee_id") or "")],
         } for row in committee_records]
         statuses = {str(row.get("membership_status") or "UNKNOWN").upper() for row in committee_records}
@@ -443,6 +456,27 @@ def assemble_institutional_dossier(
         quality.status = "NOT_RESEARCH_READY"
         if "POINT_IN_TIME_LEAKAGE" not in quality.blockers:
             quality.blockers.append({"code": "POINT_IN_TIME_LEAKAGE", "module": "point_in_time", "severity": "CRITICAL", "reason": "Future-dated records were present in the working source set.", "required_action": "Exclude future records before releasing the dossier."})
+    issuer_identity = dict(getattr(base, "issuer_identity", {}) or base.metadata.get("issuer_identity") or {})
+    issuer_identity.setdefault("requested_ticker", base.ticker)
+    issuer_identity.setdefault("resolved_ticker", base.ticker)
+    issuer_identity.setdefault("legal_name", base.company_name)
+    issuer_identity.setdefault("issuer_cik", getattr(base, "issuer_cik", None))
+    issuer_identity.setdefault("normalized_legal_name", re.sub(r"[^a-z0-9]+", " ", str(issuer_identity.get("legal_name") or "").casefold()).strip())
+    issuer_identity.setdefault("identity_version", issuer_identity.get("lineage_version") or "issuer-lineage-v1")
+    issuer_identity.setdefault("identity_confidence", "HIGH" if issuer_identity.get("issuer_cik") else "MEDIUM")
+    issuer_identity.setdefault("identity_hash", canonical_identity_hash(ticker=base.ticker, exchange=issuer_identity.get("exchange"), cik=issuer_identity.get("issuer_cik"), legal_name=issuer_identity.get("legal_name"), lineage_version=issuer_identity.get("lineage_version") or issuer_identity.get("identity_version") or "issuer-lineage-v1"))
+    expected_identity_hash = canonical_identity_hash(ticker=base.ticker, exchange=issuer_identity.get("exchange"), cik=(getattr(base, "issuer_cik", None) or issuer_identity.get("issuer_cik")), legal_name=issuer_identity.get("legal_name"), lineage_version=issuer_identity.get("lineage_version") or issuer_identity.get("identity_version") or "issuer-lineage-v1")
+    identity_mismatch = (
+        str(issuer_identity.get("resolved_ticker") or base.ticker).upper() != base.ticker
+        or str(issuer_identity.get("legal_name") or "").strip().casefold() != str(base.company_name or "").strip().casefold()
+        or (getattr(base, "issuer_cik", None) and issuer_identity.get("issuer_cik") and str(getattr(base, "issuer_cik")) != str(issuer_identity.get("issuer_cik")))
+        or (issuer_identity.get("identity_hash") and str(issuer_identity.get("identity_hash")) != expected_identity_hash)
+    )
+    if identity_mismatch and "ISSUER_IDENTITY_MISMATCH" not in quality.blockers:
+        quality.status = "NOT_RESEARCH_READY"
+        quality.blockers.append({"code": "ISSUER_IDENTITY_MISMATCH", "module": "issuer_identity", "severity": "CRITICAL", "reason": "Dossier identity fields are inconsistent with the requested ticker.", "required_action": "Rebuild from the ticker-scoped authoritative issuer identity."})
+    scoring["issuer_identity_valid"] = not identity_mismatch
+    scoring["issuer_identity_hash"] = issuer_identity.get("identity_hash")
     scoring["decision_grade"] = quality.status == "RESEARCH_READY"
     scoring["released_score"] = scoring.get("calculated_score") if scoring["decision_grade"] else None
     if not scoring["decision_grade"]:
@@ -517,8 +551,11 @@ def assemble_institutional_dossier(
             "canonical_catalysts": len(catalyst_records),
             "source_cutoff": as_of_date,
             "coverage_diagnostics": coverage_diagnostics,
+            "issuer_identity": issuer_identity,
         },
         analytical_provenance=_analytical_provenance(artifacts_root, base.ticker),
+        issuer_cik=issuer_identity.get("issuer_cik"),
+        issuer_identity=issuer_identity,
     )
 
 

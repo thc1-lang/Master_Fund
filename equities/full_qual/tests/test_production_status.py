@@ -12,6 +12,7 @@ from qualitative_ir_downloader.production_status import (
     completeness,
     document_metrics,
 )
+from qualitative_ir_downloader.report_accounting import report_coverage_diagnostics
 
 
 class ProductionStatusTests(unittest.TestCase):
@@ -97,6 +98,22 @@ class ProductionStatusTests(unittest.TestCase):
         self.assertTrue(result["events"])
         self.assertFalse(result["transcript"])
         self.assertEqual(result["limitations"], ["event_media_protected"])
+
+    def test_critical_report_coverage_is_not_ordinary_success(self):
+        records = [{"status": "DOWNLOADED", "title": "Annual Report", "resolved_document_url": "https://ir.example.com/report.pdf"}]
+        records.extend({"status": "FAILED", "title": f"Report {index}"} for index in range(298))
+        diagnostics = report_coverage_diagnostics(records, discovered=299)
+        self.assertEqual(diagnostics["downloaded_reports"], 1)
+        self.assertLess(diagnostics["success_rate"], 0.01)
+        self.assertIn("REPORT_DOWNLOAD_COVERAGE_CRITICAL", diagnostics["limitations"])
+        overall, limitations = aggregate_status(
+            ir="SUCCESS", news="SUCCESS", reports="SUCCESS_WITH_LIMITATIONS", events="NOT_APPLICABLE",
+            news_metrics={"newly_saved": 1, "cached": 0},
+            reports_metrics={"newly_saved": 1, "cached": 0}, event_metrics={},
+            source_limitations=diagnostics["limitations"],
+        )
+        self.assertEqual(overall, "SUCCESS_WITH_LIMITATIONS")
+        self.assertIn("REPORT_DOWNLOAD_COVERAGE_CRITICAL", limitations)
 
 
 class DocumentCacheTests(unittest.IsolatedAsyncioTestCase):

@@ -23,6 +23,7 @@ from .main import ManagementIntelligenceProvider
 from .sec_sources import SECManagementSourceProvider
 from insider_intelligence.sec_ingestion import SECSourceProvider
 from .overboarding import build_overboarding
+from .people import normalize_name
 from .related_parties import extract_related_parties
 from .shareholder_rights import extract_shareholder_rights
 from .store import ManagementStore
@@ -125,10 +126,13 @@ def build_governance(
     store = ManagementStore(store_root)
     governance_store = GovernanceStore(store_root)
     catalog = GovernanceSourceCatalog(store_root=store_root, sec_cache_root=sec_cache_root, normalized_root=normalized_root, as_of_date=as_of_date)
-    proxy = catalog.latest_proxy(ticker)
+    # ``proxy`` is retained as a compatibility variable for the existing
+    # governance parsers.  For foreign issuers the primary source may be a
+    # 20-F, annual report or AGM-result 6-K.
+    proxy = catalog.latest_primary(ticker) or catalog.latest_proxy(ticker)
     warnings: list[str] = []
     if proxy is None:
-        warnings.append("no cached DEF 14A proxy available")
+        warnings.append("NO_ELIGIBLE_SOURCE")
     if not any(re.search(r"charter|bylaw|exhibit", source.local_path or "", re.IGNORECASE) for source in catalog.sources(ticker)):
         warnings.append("cached charter/bylaw exhibits unavailable; rights remain proxy-limited")
     # A normalized SEC proxy is an authoritative source handoff.  If 6A has
@@ -156,9 +160,45 @@ def build_governance(
         if source is not None:
             member.source_date = member.source_date or source.filing_date
         member.public_availability_date = member.public_availability_date or member.source_date or (proxy.available_date if proxy else None) or (proxy.filing_date if proxy else None)
+    # A current annual/20-F roster is a point-in-time snapshot.  Later AGM
+    # results and other official issuer filings can change that roster before
+    # the requested cutoff.  Reconcile those generic role-change events before
+    # committees and leadership are derived; retain the historical source rows
+    # in the management store rather than deleting them.
+    people_by_id = {person.person_id: person for person in store.list_people()}
+    role_changes = store.list_role_changes(ticker)
+    for member in board:
+        member_name = normalize_name(people_by_id.get(member.person_id).full_name) if people_by_id.get(member.person_id) else ""
+        member_tokens = set(member_name.split())
+        for change in role_changes:
+            if change.effective_date and change.effective_date > as_of_date:
+                continue
+            change_name = normalize_name(change.person_name or "")
+            change_tokens = set(change_name.split())
+            name_match = bool(change_name and member_name and (change_name == member_name or (len(change_tokens) >= 2 and change_tokens <= member_tokens)))
+            matches = bool(change.person_id and change.person_id == member.person_id) or name_match
+            if not matches:
+                continue
+            if change.event_type in {"departure", "resignation", "retirement"}:
+                member.is_current = False
+                member.board_status = "HISTORICAL"
+                member.end_date = member.end_date or change.effective_date
+            elif change.event_type == "appointment":
+                member.is_current = True
+                member.board_status = "CURRENT"
+    board = [member for member in board if member.is_current]
     people = store.list_people()
     roles = store.list_roles(ticker)
     committees = extract_committees(ticker, proxy, people, board)
+    # Every governance record retains the normalized SEC document identity in
+    # addition to accession/source URL.  This keeps the routing chain
+    # auditable even when multiple cached representations share an accession.
+    if proxy is not None:
+        for committee in committees:
+            committee.normalized_document_id = proxy.normalized_document_id
+            committee.source_filed_at = proxy.filing_date
+            committee.source_period = proxy.report_date
+            committee.as_of_eligibility = "ELIGIBLE" if not proxy.filing_date or proxy.filing_date <= as_of_date else "INELIGIBLE_FUTURE"
     if proxy is not None:
         proxy_text = proxy.text or ""
         has_independence_language = bool(re.search(r"independent\s+(?:director|nominee)|independence", proxy_text, re.I))
@@ -183,7 +223,7 @@ def build_governance(
         committee.member_independence = {person_id: value for person_id, value in committee.member_independence.items() if person_id in current_ids}
         committee.financial_expert_person_ids = [person_id for person_id in committee.financial_expert_person_ids if person_id in current_ids]
         committee.financial_background = {person_id: value for person_id, value in committee.financial_background.items() if person_id in current_ids}
-    for role_change in store.list_role_changes(ticker):
+    for role_change in role_changes:
         if role_change.event_type == "appointment" and role_change.person_id and role_change.person_id in current_ids and re.search(r"audit committee", role_change.evidence_text or "", re.IGNORECASE):
             audit = next((item for item in committees if item.committee_type == "audit"), None)
             if audit and role_change.person_id not in audit.members:
@@ -209,6 +249,57 @@ def build_governance(
     related_status_with_records = dict(related_status)
     related_status_with_records["_records"] = related
     coverage = _coverage(ticker, as_of_date, board=board, committees=committees, expertise=expertise, overboarding=overboarding, related_status=related_status_with_records, classes=classes, rights=rights, warnings=warnings)
+    eligible_proxies = catalog.primary_sources(ticker)
+    candidate_rows = [
+        row for row in store.list_boards(ticker)
+        if (row.board_ticker or row.ticker).upper() == ticker
+    ]
+    committee_failures = sum(
+        item.membership_status == "EXTRACTION_FAILED" or item.source_status == "EXTRACTION_FAILED"
+        for item in committees
+    )
+    linked_members = len({person_id for item in committees for person_id in item.members})
+    known_independence = sum(item.is_independent != "UNKNOWN" for item in board)
+    # This is deliberately a coverage score, not an assessment of governance
+    # quality.  Missing optional fields reduce completeness without becoming a
+    # critical extraction failure once the board roster is validated.
+    completeness_score = (
+        (40 if board else 0)
+        + (20 if committees else 0)
+        + (15 if linked_members else 0)
+        + (15 if known_independence else 0)
+        + (10 if board and all(item.start_date for item in board) else 0)
+    )
+    coverage.proxy_sources_eligible = len(eligible_proxies)
+    coverage.board_member_candidates = len(candidate_rows)
+    coverage.board_members_validated = len(board)
+    coverage.board_members_rejected = max(0, len(candidate_rows) - len(board))
+    coverage.committees_found = len(committees)
+    coverage.committee_members_linked = linked_members
+    coverage.committee_member_extraction_failures = committee_failures
+    coverage.current_directors = len(board)
+    coverage.historical_directors = sum(not row.is_current for row in candidate_rows)
+    coverage.nominees = 0
+    coverage.independence_status_known = known_independence
+    coverage.governance_completeness_score = completeness_score
+    governance_diagnostics = {
+        "GOVERNANCE_PRIMARY_SOURCES": len(eligible_proxies),
+        "PROXY_SOURCES_ELIGIBLE": len(eligible_proxies),
+        "BOARD_MEMBER_CANDIDATES": len(candidate_rows),
+        "BOARD_MEMBERS_VALIDATED": len(board),
+        "BOARD_MEMBERS_REJECTED": max(0, len(candidate_rows) - len(board)),
+        "INDEPENDENCE_KNOWN": known_independence,
+        "INDEPENDENCE_UNKNOWN": sum(item.is_independent == "UNKNOWN" for item in board),
+        "COMMITTEES_FOUND": len(committees),
+        "COMMITTEE_MEMBERS_LINKED": linked_members,
+        "COMMITTEE_MEMBER_EXTRACTION_FAILURES": committee_failures,
+        "CURRENT_DIRECTORS": len(board),
+        "HISTORICAL_DIRECTORS": sum(not row.is_current for row in candidate_rows),
+        "NOMINEES": 0,
+        "INDEPENDENCE_STATUS_KNOWN": known_independence,
+        "GOVERNANCE_COMPLETENESS_SCORE": completeness_score,
+        "CHAIR_STRUCTURE_STATUS": leadership["chair_structure"],
+    }
     independent_count = sum(item.is_independent == "INDEPENDENT" for item in board)
     known_status_count = sum(item.is_independent != "UNKNOWN" for item in board)
     independence_failed = bool(board) and known_status_count == 0
@@ -260,19 +351,19 @@ def build_governance(
         "governance_coverage": [coverage], "governance_snapshots": [snapshot],
     }
     counts = {} if dry_run else governance_store.replace_ticker_transaction(ticker, records, run_id=f"governance-run:{ticker}:{as_of_date}")
-    run = GovernanceRun(run_id=f"governance-run:{ticker}:{as_of_date}", tickers=[ticker], as_of_date=as_of_date, records={name: len(values) for name, values in records.items()}, warnings=warnings, network_requests=catalog.network_requests, created_at=as_of_date)
+    run = GovernanceRun(run_id=f"governance-run:{ticker}:{as_of_date}", tickers=[ticker], as_of_date=as_of_date, records={name: len(values) for name, values in records.items()}, warnings=warnings, diagnostics=governance_diagnostics, network_requests=catalog.network_requests, created_at=as_of_date)
     if not dry_run:
         governance_store.record_run(run)
-    status = "AVAILABLE"
+    status = "GOVERNANCE_INSUFFICIENT"
     if proxy is not None and any(code in warnings for code in {"PROXY_PARSE_FAILED", "GOVERNANCE_EXTRACTION_FAILED", "CRITICAL_GOVERNANCE_EXTRACTION_INCOMPLETE", "GOVERNANCE_INTERNAL_INCONSISTENCY"}):
-        status = "EXTRACTION_FAILED"
-    elif proxy is not None and "SOURCE_COVERAGE_INCOMPLETE" in warnings:
-        status = "AVAILABLE_WITH_LIMITATIONS"
-    elif proxy is not None and any(str(getattr(coverage, field, "")).upper() in {"PARTIAL", "INSUFFICIENT", "UNKNOWN"} for field in ("expertise", "outside_boards", "related_parties", "shareholder_rights", "voting_structure")):
-        status = "AVAILABLE_WITH_LIMITATIONS"
+        status = "GOVERNANCE_EXTRACTION_FAILED"
+    elif board and completeness_score >= 70:
+        status = "GOVERNANCE_COMPLETE"
+    elif board:
+        status = "GOVERNANCE_PARTIAL"
     elif proxy is None:
-        status = "SOURCE_UNAVAILABLE"
-    return {"ticker": ticker, "proxy": proxy, "board": board, "committees": committees, "tenure": tenure, "refreshment": refresh, "expertise": expertise, "overboarding": overboarding, "related": related, "related_status": related_status, "classes": classes, "voting": voting, "rights": rights, "events": events, "coverage": coverage, "snapshot": snapshot, "counts": counts, "run": run, "warnings": warnings, "status": status}
+        status = "GOVERNANCE_SOURCE_UNAVAILABLE"
+    return {"ticker": ticker, "proxy": proxy, "board": board, "committees": committees, "tenure": tenure, "refreshment": refresh, "expertise": expertise, "overboarding": overboarding, "related": related, "related_status": related_status, "classes": classes, "voting": voting, "rights": rights, "events": events, "coverage": coverage, "snapshot": snapshot, "counts": counts, "run": run, "warnings": warnings, "diagnostics": governance_diagnostics, "status": status}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -297,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         result = build_governance(ticker, as_of_date=args.as_of_date, store_root=args.store_root, sec_cache_root=args.sec_cache_root, normalized_root=args.normalized_root, force=args.force, dry_run=args.dry_run)
         snapshot = result["snapshot"]
         coverage = result["coverage"]
-        print(json.dumps({"ticker": ticker.upper(), "status": result["status"], "board_size": snapshot.board_size, "independent_directors": snapshot.independent_count, "independent_percentage": snapshot.independent_percentage, "chair_structure": snapshot.chair_structure, "committees": len(result["committees"]), "average_tenure": snapshot.average_tenure, "median_tenure": snapshot.median_tenure, "share_class_structure": snapshot.share_class_structure, "coverage": coverage.to_dict(), "warnings": result["warnings"]}, sort_keys=True))
+        print(json.dumps({"ticker": ticker.upper(), "status": result["status"], "board_size": snapshot.board_size, "independent_directors": snapshot.independent_count, "independent_percentage": snapshot.independent_percentage, "chair_structure": snapshot.chair_structure, "committees": len(result["committees"]), "average_tenure": snapshot.average_tenure, "median_tenure": snapshot.median_tenure, "share_class_structure": snapshot.share_class_structure, "coverage": coverage.to_dict(), "diagnostics": result.get("diagnostics", {}), "warnings": result["warnings"]}, sort_keys=True))
     return 0
 
 

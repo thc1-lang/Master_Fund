@@ -11,9 +11,9 @@ from dataclasses import MISSING, asdict, dataclass, field
 from typing import Any
 
 
-GOVERNANCE_VERSION = "board-governance-v1"
-INDEPENDENCE_VERSION = "board-independence-v1"
-COMMITTEE_VERSION = "board-committees-v1"
+GOVERNANCE_VERSION = "board-governance-v2"
+INDEPENDENCE_VERSION = "board-independence-v2"
+COMMITTEE_VERSION = "board-committees-v2"
 VOTING_STRUCTURE_VERSION = "voting-structure-v1"
 RIGHTS_VERSION = "shareholder-rights-v1"
 
@@ -61,12 +61,17 @@ class GovernanceBoardMembership(DictRecord):
     source_accession: str | None = None
     source_form: str | None = None
     source_date: str | None = None
+    source_filed_at: str | None = None
+    source_period: str | None = None
+    as_of_eligibility: str = "ELIGIBLE"
     local_source_path: str | None = None
+    normalized_document_id: str | None = None
     evidence_text: str = ""
     created_at: str = ""
     governance_version: str = GOVERNANCE_VERSION
     independence_version: str = INDEPENDENCE_VERSION
     public_availability_date: str | None = None
+    board_status: str = "CURRENT"
 
 
 @dataclass
@@ -85,7 +90,11 @@ class BoardCommittee(DictRecord):
     source_accession: str | None = None
     source_form: str | None = None
     source_date: str | None = None
+    source_filed_at: str | None = None
+    source_period: str | None = None
+    as_of_eligibility: str = "ELIGIBLE"
     local_source_path: str | None = None
+    normalized_document_id: str | None = None
     evidence_text: str = ""
     created_at: str = ""
     committee_version: str = COMMITTEE_VERSION
@@ -294,6 +303,21 @@ class GovernanceCoverage(DictRecord):
     expertise_diagnostics: dict[str, str] = field(default_factory=dict)
     rights_source_coverage: str = "UNKNOWN"
     limitations: list[str] = field(default_factory=list)
+    # Coverage diagnostics are facts about extraction completeness, not a
+    # governance-quality score.  They make a proxy parse gap distinguishable
+    # from a source that genuinely omits a field.
+    proxy_sources_eligible: int = 0
+    board_member_candidates: int = 0
+    board_members_validated: int = 0
+    board_members_rejected: int = 0
+    committees_found: int = 0
+    committee_members_linked: int = 0
+    committee_member_extraction_failures: int = 0
+    current_directors: int = 0
+    historical_directors: int = 0
+    nominees: int = 0
+    independence_status_known: int = 0
+    governance_completeness_score: int = 0
     governance_version: str = GOVERNANCE_VERSION
 
 
@@ -357,6 +381,7 @@ class GovernanceRun(DictRecord):
     as_of_date: str
     records: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
     network_requests: int = 0
     created_at: str = ""
     governance_version: str = GOVERNANCE_VERSION

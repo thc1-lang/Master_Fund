@@ -14,6 +14,7 @@ import os
 import math
 import re
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -31,14 +32,14 @@ class StageContract:
 
 STAGE_CONTRACTS: dict[str, StageContract] = {
     "acquisition": StageContract("acquisition", "acquisition-v1", "acquisition-manifest-v1"),
-    "normalization": StageContract("normalization", "qualitative-normalization-v2", "normalized-document-schema-v2", ("acquisition",)),
+    "normalization": StageContract("normalization", "qualitative-normalization-v3", "normalized-document-schema-v3", ("acquisition",)),
     "qualitative_extraction": StageContract("qualitative_extraction", "qualitative-extraction-v8", "claim-schema-v2", ("normalization",)),
-    "temporal_comparison": StageContract("temporal_comparison", "temporal-comparison-v2", "temporal-schema-v2", ("qualitative_extraction",)),
+    "temporal_comparison": StageContract("temporal_comparison", "temporal-comparison-v3", "temporal-schema-v2", ("qualitative_extraction",)),
     "state_synthesis": StageContract("state_synthesis", "qualitative-state-v2", "state-schema-v2", ("qualitative_extraction", "temporal_comparison")),
     "insider_intelligence": StageContract("insider_intelligence", "insider-intelligence-v2", "insider-schema-v2", ("acquisition",)),
-    "management_intelligence": StageContract("management_intelligence", "management-intelligence-v2", "management-schema-v2", ("normalization",)),
+    "management_intelligence": StageContract("management_intelligence", "management-intelligence-v3", "management-schema-v3", ("normalization",)),
     "management_track_record": StageContract("management_track_record", "management-track-record-v2", "track-record-schema-v2", ("management_intelligence", "qualitative_extraction")),
-    "governance_intelligence": StageContract("governance_intelligence", "governance-pipeline-v2", "governance-schema-v2", ("normalization", "management_intelligence")),
+    "governance_intelligence": StageContract("governance_intelligence", "governance-pipeline-v3", "governance-schema-v3", ("normalization", "management_intelligence")),
     "scoring": StageContract("scoring", "qualitative-scoring-v2.0", "score-schema-v2", ("state_synthesis", "management_track_record", "governance_intelligence", "insider_intelligence")),
     # The dossier assembles the complete analytical handoff, so every
     # material upstream generation is part of its compatibility contract.
@@ -61,18 +62,22 @@ STAGE_CONTRACTS: dict[str, StageContract] = {
 _COMMON_ANALYTICAL = ("pipeline_runner/compatibility.py",)
 STAGE_SOURCE_FILES: dict[str, tuple[str, ...]] = {
     "acquisition": (
+        "qualitative_ir_downloader/acquisition_priority.py",
+        "qualitative_ir_downloader/config.py",
+        "qualitative_ir_downloader/crawler.py",
         "qualitative_ir_downloader/main.py",
         "qualitative_ir_downloader/manifest.py",
         "qualitative_ir_downloader/models.py",
+        "qualitative_ir_downloader/official_sources.py",
     ),
     "normalization": _COMMON_ANALYTICAL + ("qualitative_analysis/ingestion.py", "qualitative_analysis/normalization.py", "qualitative_analysis/models.py", "qualitative_analysis/fiscal_periods.py", "qualitative_analysis/point_in_time.py"),
     "qualitative_extraction": _COMMON_ANALYTICAL + ("qualitative_analysis/extraction_rules.py", "qualitative_analysis/qualitative_extraction.py", "qualitative_analysis/extraction_models.py", "qualitative_analysis/evidence.py", "qualitative_analysis/point_in_time.py", "qualitative_analysis/topic_normalization.py", "qualitative_analysis/fiscal_periods.py"),
     "temporal_comparison": _COMMON_ANALYTICAL + ("qualitative_analysis/main.py", "qualitative_analysis/temporal_comparison.py", "qualitative_analysis/temporal_models.py", "qualitative_analysis/temporal_rules.py", "qualitative_analysis/point_in_time.py"),
-    "state_synthesis": _COMMON_ANALYTICAL + ("qualitative_analysis/state_synthesis.py", "qualitative_analysis/state_models.py", "qualitative_analysis/state_rules.py", "qualitative_analysis/state_store.py", "qualitative_analysis/state_confidence.py", "qualitative_analysis/point_in_time.py", "qualitative_analysis/fiscal_periods.py", "qualitative_analysis/topic_normalization.py"),
+    "state_synthesis": _COMMON_ANALYTICAL + ("qualitative_analysis/main.py", "qualitative_analysis/state_synthesis.py", "qualitative_analysis/state_models.py", "qualitative_analysis/state_rules.py", "qualitative_analysis/state_store.py", "qualitative_analysis/state_confidence.py", "qualitative_analysis/point_in_time.py", "qualitative_analysis/fiscal_periods.py", "qualitative_analysis/topic_normalization.py"),
     "insider_intelligence": _COMMON_ANALYTICAL + ("insider_intelligence/main.py", "insider_intelligence/sec_sources.py", "insider_intelligence/models.py"),
-    "management_intelligence": _COMMON_ANALYTICAL + ("management_intelligence/main.py", "management_intelligence/normalized_sources.py", "management_intelligence/sec_sources.py", "management_intelligence/models.py", "management_intelligence/store.py", "management_intelligence/organization_resolution.py", "management_intelligence/career_history.py"),
+    "management_intelligence": _COMMON_ANALYTICAL + ("management_intelligence/main.py", "management_intelligence/normalized_sources.py", "management_intelligence/sec_sources.py", "management_intelligence/source_roles.py", "management_intelligence/models.py", "management_intelligence/store.py", "management_intelligence/organization_resolution.py", "management_intelligence/career_history.py"),
     "management_track_record": _COMMON_ANALYTICAL + ("management_intelligence/guidance_track_record.py", "management_intelligence/guidance_database.py", "management_intelligence/track_record_models.py", "management_intelligence/operating_outcomes.py", "management_intelligence/capital_allocation_engine.py", "qualitative_analysis/business_intelligence.py"),
-    "governance_intelligence": _COMMON_ANALYTICAL + ("management_intelligence/governance_cli.py", "management_intelligence/governance_store.py", "management_intelligence/governance_sources.py", "management_intelligence/board_committees.py", "management_intelligence/board_governance_models.py", "management_intelligence/shareholder_rights.py", "management_intelligence/store.py", "management_intelligence/board_composition.py", "management_intelligence/career_history.py"),
+    "governance_intelligence": _COMMON_ANALYTICAL + ("management_intelligence/governance_cli.py", "management_intelligence/governance_store.py", "management_intelligence/governance_sources.py", "management_intelligence/source_roles.py", "management_intelligence/board_committees.py", "management_intelligence/board_governance_models.py", "management_intelligence/shareholder_rights.py", "management_intelligence/store.py", "management_intelligence/board_composition.py", "management_intelligence/career_history.py"),
     "scoring": _COMMON_ANALYTICAL + ("scoring_engine/engine.py", "scoring_engine/qualitative_scoring.py", "scoring_engine/aggregation.py", "scoring_engine/factor_registry.py", "scoring_engine/factor_rules.py", "scoring_engine/governance_scoring.py", "scoring_engine/management_scoring.py", "scoring_engine/insider_scoring.py", "scoring_engine/coverage.py", "scoring_engine/profiles.py", "scoring_engine/models.py", "config/scoring/core_v2.json", "config/scoring/factor_definitions.json"),
     "dossier_generation": _COMMON_ANALYTICAL + ("research_output/v2.py", "research_output/v2_models.py", "research_output/v2_engines.py", "research_output/assembler.py", "research_output/models.py", "research_output/main.py"),
 }
@@ -83,7 +88,7 @@ STAGE_SOURCE_FILES: dict[str, tuple[str, ...]] = {
 # ``configuration_fingerprint``/``record`` when a profile has configurable
 # semantics.
 STAGE_CONFIGURATIONS: dict[str, dict[str, Any]] = {
-    "temporal_comparison": {"period_semantics": "issuer-fiscal-period-v2"},
+    "temporal_comparison": {"period_semantics": "issuer-fiscal-period-v3-pit-observed-only"},
     "state_synthesis": {"current_period_selection": "point-in-time-v2"},
 }
 
@@ -244,6 +249,45 @@ _STAGE_ARTIFACT_FILES: dict[str, tuple[str, ...]] = {
 }
 
 
+# Windows can transiently deny replacement while another process still has a
+# handle open on the destination (or while the filesystem is releasing a
+# previous temporary handle).  Keep this retry policy local to atomic
+# metadata replacement; it must not turn unrelated filesystem errors into
+# silent success.
+ATOMIC_REPLACE_MAX_ATTEMPTS = 6
+ATOMIC_REPLACE_BACKOFF_SECONDS = (0.02, 0.04, 0.08, 0.16, 0.32)
+_TRANSIENT_WINDOWS_ERRORS = {5, 32, 33}  # access, sharing, and lock violation
+
+
+def _is_transient_atomic_replace_error(error: OSError) -> bool:
+    if isinstance(error, PermissionError):
+        return True
+    return getattr(error, "winerror", None) in _TRANSIENT_WINDOWS_ERRORS
+
+
+def _atomic_replace_with_retry(source: str | Path, destination: str | Path, *,
+                               max_attempts: int = ATOMIC_REPLACE_MAX_ATTEMPTS,
+                               sleep: Any = None) -> None:
+    """Atomically replace *destination*, retrying transient Windows locks.
+
+    ``os.replace`` remains the only commit operation.  The caller owns the
+    temporary file lifecycle so it can preserve the primary replacement error
+    while safely cleaning up an uncommitted temporary path.
+    """
+    source_path = Path(source)
+    destination_path = Path(destination)
+    attempts = max(1, int(max_attempts))
+    sleep_fn = sleep or time.sleep
+    for attempt in range(attempts):
+        try:
+            os.replace(source_path, destination_path)
+            return
+        except OSError as error:
+            if not _is_transient_atomic_replace_error(error) or attempt + 1 >= attempts:
+                raise
+            sleep_fn(ATOMIC_REPLACE_BACKOFF_SECONDS[min(attempt, len(ATOMIC_REPLACE_BACKOFF_SECONDS) - 1)])
+
+
 def _artifact_ticker_match(value: Any, ticker: str) -> bool:
     if isinstance(value, Mapping):
         for key in ("ticker", "issuer_ticker", "board_ticker", "employer_ticker", "target_ticker"):
@@ -336,11 +380,22 @@ class ArtifactCompatibilityStore:
         os.close(fd)
         temporary = Path(temp_name)
         try:
-            temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            os.replace(temporary, self.path)
+            # Close the application-owned handle before replacement.  The
+            # explicit flush makes the handoff deterministic without imposing
+            # directory fsync overhead on every compatibility metadata write.
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(value, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+            _atomic_replace_with_retry(temporary, self.path)
         finally:
             if temporary.exists():
-                temporary.unlink()
+                try:
+                    temporary.unlink()
+                except OSError:
+                    # Never mask the primary write/replacement exception with
+                    # best-effort cleanup failure.
+                    pass
 
     def get(self, stage: str, ticker: str) -> dict[str, Any] | None:
         value = self._read()
